@@ -1,0 +1,19 @@
+# Compiled binary
+webrtc-vnc
+
+# Local ffmpeg copy with cap_sys_admin (created by setup.sh)
+ffmpeg-cap
+
+# NvFBC/NVENC helper binaries (built from cmd/nvfbc/ by setup.sh)
+nvfbc_capture
+nvfbc_nvenc
+
+# Go build cache
+*.test
+*.out
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+*~

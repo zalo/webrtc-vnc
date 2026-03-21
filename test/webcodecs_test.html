@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+<head><title>WebCodecs H.264 Test</title></head>
+<body style="margin:0;background:#000">
+<canvas id="canvas" width="320" height="240" style="width:100%;height:100%"></canvas>
+<div id="status" style="position:fixed;top:10px;left:10px;color:#0f0;font:14px monospace;z-index:10"></div>
+<script>
+var canvas = document.getElementById('canvas');
+var ctx = canvas.getContext('2d');
+var status = document.getElementById('status');
+var log = '';
+function addLog(msg) { log += msg + '\n'; status.textContent = log; console.log(msg); }
+
+async function runTest() {
+  addLog('Fetching H.264 test stream...');
+  var resp = await fetch('/test.h264');
+  var buf = await resp.arrayBuffer();
+  var data = new Uint8Array(buf);
+  addLog('Got ' + data.length + ' bytes');
+
+  // Find all NAL start code positions
+  var nalStarts = [];
+  for (var i = 0; i <= data.length - 4; i++) {
+    if (data[i]===0 && data[i+1]===0 && data[i+2]===0 && data[i+3]===1) {
+      nalStarts.push(i);
+    }
+  }
+  addLog('Found ' + nalStarts.length + ' NAL units');
+
+  // Group NALs into access units (frames)
+  // Each VCL NAL (type 1 or 5) ends an access unit
+  var frames = [];
+  var currentFrame = null;
+  for (var n = 0; n < nalStarts.length; n++) {
+    var start = nalStarts[n];
+    var end = (n+1 < nalStarts.length) ? nalStarts[n+1] : data.length;
+    var nalType = data[start+4] & 0x1F;
+
+    if (currentFrame === null) {
+      currentFrame = {start: start, end: end, isKey: false, types: []};
+    } else {
+      currentFrame.end = end;
+    }
+    currentFrame.types.push(nalType);
+    if (nalType === 5) currentFrame.isKey = true;
+
+    // VCL NAL ends the access unit
+    if (nalType >= 1 && nalType <= 5) {
+      frames.push(currentFrame);
+      currentFrame = null;
+    }
+  }
+  addLog('Parsed ' + frames.length + ' frames');
+
+  // Try AVCC mode (with description)
+  addLog('--- Testing AVCC mode ---');
+  await testAVCC(data, nalStarts, frames);
+
+  // Try Annex B mode (no description)
+  addLog('--- Testing Annex B mode ---');
+  await testAnnexB(data, frames);
+}
+
+async function testAVCC(data, nalStarts, frames) {
+  // Extract SPS and PPS
+  var sps = null, pps = null;
+  for (var n = 0; n < nalStarts.length; n++) {
+    var start = nalStarts[n] + 4;
+    var end = (n+1 < nalStarts.length) ? nalStarts[n+1] : data.length;
+    // Trim trailing zeros
+    while (end > start && data[end-1] === 0) end--;
+    var nal = data.subarray(start, end);
+    var t = nal[0] & 0x1F;
+    if (t === 7 && !sps) sps = nal;
+    if (t === 8 && !pps) pps = nal;
+  }
+  if (!sps || !pps) { addLog('AVCC: no SPS/PPS found'); return; }
+  addLog('AVCC: SPS=' + sps.length + 'b PPS=' + pps.length + 'b profile=' + sps[1].toString(16) + ' level=' + sps[3].toString(16));
+
+  // Build AVCC description
+  var desc = new Uint8Array(11 + sps.length + pps.length);
+  desc[0]=1; desc[1]=sps[1]; desc[2]=sps[2]; desc[3]=sps[3]; desc[4]=0xFF; desc[5]=0xE1;
+  desc[6]=(sps.length>>8)&0xFF; desc[7]=sps.length&0xFF;
+  desc.set(sps, 8);
+  var o=8+sps.length; desc[o]=1; desc[o+1]=(pps.length>>8)&0xFF; desc[o+2]=pps.length&0xFF;
+  desc.set(pps, o+3);
+
+  var codec = 'avc1.' + ('0'+sps[1].toString(16)).slice(-2) + ('0'+sps[2].toString(16)).slice(-2) + ('0'+sps[3].toString(16)).slice(-2);
+  addLog('AVCC codec: ' + codec);
+
+  var support = await VideoDecoder.isConfigSupported({codec:codec, description:desc.buffer, optimizeForLatency:true});
+  addLog('AVCC supported: ' + support.supported);
+  if (!support.supported) return;
+
+  await decodeFrames('AVCC', {codec:codec, description:desc.buffer, optimizeForLatency:true}, data, frames, true);
+}
+
+async function testAnnexB(data, frames) {
+  var codec = 'avc1.42c02a';
+  var support = await VideoDecoder.isConfigSupported({codec:codec, optimizeForLatency:true});
+  addLog('AnnexB supported (' + codec + '): ' + support.supported);
+
+  if (support.supported) {
+    await decodeFrames('AnnexB', {codec:codec, optimizeForLatency:true}, data, frames, false);
+  }
+}
+
+function decodeFrames(label, config, data, frames, useAVCC) {
+  return new Promise(function(resolve) {
+    var decoded = 0, errors = 0;
+
+    var decoder = new VideoDecoder({
+      output: function(frame) {
+        canvas.width = frame.displayWidth;
+        canvas.height = frame.displayHeight;
+        ctx.drawImage(frame, 0, 0);
+        frame.close();
+        decoded++;
+        if (decoded <= 3 || decoded % 10 === 0) {
+          // Check if canvas has non-black pixels
+          var sample = ctx.getImageData(canvas.width/2, canvas.height/2, 1, 1).data;
+          addLog(label + ' frame ' + decoded + ': ' + frame.displayWidth + 'x' + frame.displayHeight + ' pixel=rgba(' + sample[0]+','+sample[1]+','+sample[2]+','+sample[3]+')');
+        }
+        if (decoded >= frames.length) {
+          addLog(label + ': done, decoded=' + decoded + ' errors=' + errors);
+          decoder.close();
+          resolve();
+        }
+      },
+      error: function(e) {
+        errors++;
+        addLog(label + ' ERROR: ' + (e.message || e.name || String(e)));
+        if (errors > 3) { decoder.close(); resolve(); }
+      }
+    });
+
+    decoder.configure(config);
+    addLog(label + ': configured, decoding ' + frames.length + ' frames...');
+
+    for (var f = 0; f < frames.length; f++) {
+      var frameData;
+      if (useAVCC) {
+        // Convert frame to AVCC: extract VCL NALs, prepend 4-byte lengths
+        var frameBytes = data.subarray(frames[f].start, frames[f].end);
+        // Find VCL NALs in this frame
+        var vclParts = [];
+        for (var i = 0; i <= frameBytes.length - 4; i++) {
+          if (frameBytes[i]===0 && frameBytes[i+1]===0 && frameBytes[i+2]===0 && frameBytes[i+3]===1) {
+            var nalStart = i + 4;
+            var nalEnd = frameBytes.length;
+            for (var j = nalStart; j <= frameBytes.length - 4; j++) {
+              if (frameBytes[j]===0 && frameBytes[j+1]===0 && frameBytes[j+2]===0 && frameBytes[j+3]===1) { nalEnd = j; break; }
+            }
+            var nt = frameBytes[nalStart] & 0x1F;
+            if (nt >= 1 && nt <= 5) {
+              // Trim trailing zeros
+              while (nalEnd > nalStart && frameBytes[nalEnd-1] === 0) nalEnd--;
+              vclParts.push(frameBytes.subarray(nalStart, nalEnd));
+            }
+          }
+        }
+        // Build AVCC
+        var total = 0;
+        for (var v = 0; v < vclParts.length; v++) total += 4 + vclParts[v].length;
+        var avcc = new Uint8Array(total);
+        var pos = 0;
+        for (var v = 0; v < vclParts.length; v++) {
+          var len = vclParts[v].length;
+          avcc[pos]=(len>>>24)&0xFF; avcc[pos+1]=(len>>>16)&0xFF; avcc[pos+2]=(len>>>8)&0xFF; avcc[pos+3]=len&0xFF;
+          avcc.set(vclParts[v], pos+4);
+          pos += 4 + len;
+        }
+        frameData = avcc.buffer;
+      } else {
+        // Annex B: pass raw data for entire frame
+        frameData = data.slice(frames[f].start, frames[f].end).buffer;
+      }
+
+      try {
+        decoder.decode(new EncodedVideoChunk({
+          type: frames[f].isKey ? 'key' : 'delta',
+          timestamp: f * (1000000 / 30),
+          data: frameData,
+        }));
+      } catch(e) {
+        addLog(label + ' decode throw frame ' + f + ': ' + e.message);
+      }
+    }
+  });
+}
+
+window._testDone = false;
+runTest().then(function() {
+  addLog('=== ALL TESTS COMPLETE ===');
+  window._testDone = true;
+});
+</script>
+</body>
+</html>

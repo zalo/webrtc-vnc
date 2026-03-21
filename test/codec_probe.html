@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html><body>
+<pre id="out"></pre>
+<script>
+var out = document.getElementById('out');
+var codecs = [
+  'avc1.42c02a', // Constrained Baseline 4.2 (our current)
+  'avc1.42002a', // Baseline 4.2 (no constraints)
+  'avc1.42001f', // Baseline 3.1
+  'avc1.42e01f', // Constrained Baseline 3.1 (common)
+  'avc1.42e028', // Constrained Baseline 4.0
+  'avc1.42e02a', // Constrained Baseline 4.2
+  'avc1.42e032', // Constrained Baseline 5.0
+  'avc1.42e034', // Constrained Baseline 5.2
+  'avc1.4d001f', // Main 3.1
+  'avc1.4d0028', // Main 4.0
+  'avc1.4d0032', // Main 5.0
+  'avc1.640028', // High 4.0
+  'avc1.640032', // High 5.0
+];
+async function test() {
+  out.textContent = 'Testing VideoDecoder codec support...\n\n';
+  for (var i = 0; i < codecs.length; i++) {
+    var c = codecs[i];
+    try {
+      // Test without description (Annex B)
+      var r1 = await VideoDecoder.isConfigSupported({codec: c, optimizeForLatency: true});
+      // Test with dummy description (AVCC)
+      var sps = new Uint8Array([0x67, 0x42, 0xc0, 0x2a, 0x95, 0x90, 0x07, 0x80, 0x22, 0x7e, 0x5c, 0x04, 0x40, 0x00, 0x00, 0xfa, 0x00, 0x00, 0x75, 0x30, 0x21]);
+      var pps = new Uint8Array([0x68, 0xcb, 0x8f, 0x20]);
+      var desc = new Uint8Array(11 + sps.length + pps.length);
+      desc[0]=1; desc[1]=0x42; desc[2]=0xc0; desc[3]=0x2a; desc[4]=0xFF; desc[5]=0xE1;
+      desc[6]=0; desc[7]=sps.length; desc.set(sps, 8);
+      var o=8+sps.length; desc[o]=1; desc[o+1]=0; desc[o+2]=pps.length; desc.set(pps, o+3);
+      var r2 = await VideoDecoder.isConfigSupported({codec: c, description: desc.buffer, optimizeForLatency: true});
+      out.textContent += c + '  annexb=' + r1.supported + '  avcc=' + r2.supported + '\n';
+    } catch(e) {
+      out.textContent += c + '  error=' + e.message + '\n';
+    }
+  }
+  out.textContent += '\nDone.';
+  window._probeDone = true;
+}
+window._probeDone = false;
+test();
+</script>
+</body></html>
