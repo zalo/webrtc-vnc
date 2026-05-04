@@ -117,9 +117,10 @@ class WebRTCVNC {
       videoPathLabel: document.getElementById('videoPathLabel')
     };
 
-    // Video path preference
-    this.useDataChannel = localStorage.getItem('webrtcVncDC') !== 'false';
-    this.videoDCMode = localStorage.getItem('webrtcVncDCMode') || 'reliable-ordered';
+    // Video path: server only offers the WebRTC media track now.
+    // The legacy WebCodecs-over-DataChannel path is gone.
+    this.useDataChannel = false;
+    this.videoDCMode = 'reliable-ordered';
 
     // Console capture is done inline in index.html before this script loads
     this.bindEvents();
@@ -231,6 +232,18 @@ class WebRTCVNC {
     this.elements.allowMouse?.addEventListener('change', (e) => {
       this.setGuestPermission('set_guest_mouse', e.target.checked);
     });
+
+    // Re-evaluate mobile layout on rotation/resize so portrait/landscape
+    // changes flip cover↔contain and recompute pan.
+    const onLayoutChange = () => this.applyMobileLayout();
+    window.addEventListener('resize', onLayoutChange);
+    window.addEventListener('orientationchange', onLayoutChange);
+
+    // Re-pan once we know video dimensions (videoWidth/Height arrive late).
+    if (this.elements.videoElement) {
+      this.elements.videoElement.addEventListener('loadedmetadata', () => this.applyMobileLayout());
+      this.elements.videoElement.addEventListener('resize', () => this.applyMobileLayout());
+    }
 
     // Video DC reliability dropdown
     var videoDCSelect = document.getElementById('videoDCMode');
@@ -1308,12 +1321,88 @@ class WebRTCVNC {
     this.virtualCursorX = Math.max(0, Math.min(65535, this.virtualCursorX + Math.round(screenDx * scale)));
     this.virtualCursorY = Math.max(0, Math.min(65535, this.virtualCursorY + Math.round(screenDy * scale)));
     this.sendMouseMoveAbs(this.virtualCursorX, this.virtualCursorY);
+    this.updateCursorPan();
+  }
+
+  // updateCursorPan keeps the captured cursor visually centered in the viewport
+  // while in portrait trackpad mode, by adjusting CSS object-position on the
+  // video element. With object-fit: cover, only one axis overflows; we pan that
+  // axis (clamped to [0%,100%], so cursor near edges drifts off-center).
+  updateCursorPan() {
     const video = this.elements.videoElement;
-    if (video) video.style.objectPosition = `${(this.virtualCursorX / 65535) * 100}% center`;
+    if (!video) return;
+
+    if (!this.trackpadMode || !this.isPortrait()) {
+      video.style.objectPosition = '50% 50%';
+      return;
+    }
+
+    const sw = video.videoWidth, sh = video.videoHeight;
+    const vw = video.clientWidth, vh = video.clientHeight;
+    if (!sw || !sh || !vw || !vh) return;
+
+    const sourceAR = sw / sh;
+    const viewportAR = vw / vh;
+    const cx = this.virtualCursorX / 65535;
+    const cy = this.virtualCursorY / 65535;
+
+    // Pan the axis that overflows under object-fit: cover.
+    let posX = 50, posY = 50;
+    if (sourceAR > viewportAR) {
+      const visibleFrac = viewportAR / sourceAR;
+      if (visibleFrac < 1) {
+        const p = (cx - visibleFrac / 2) / (1 - visibleFrac);
+        posX = Math.max(0, Math.min(1, p)) * 100;
+      }
+    } else if (sourceAR < viewportAR) {
+      const visibleFrac = sourceAR / viewportAR;
+      if (visibleFrac < 1) {
+        const p = (cy - visibleFrac / 2) / (1 - visibleFrac);
+        posY = Math.max(0, Math.min(1, p)) * 100;
+      }
+    }
+    video.style.objectPosition = `${posX}% ${posY}%`;
+  }
+
+  // Phone heuristic: touch input + a phone-sized viewport. Tablets and
+  // touch laptops fall through to absolute pointer mode.
+  isPhone() {
+    if (!this.isTouchDevice()) return false;
+    const minDim = Math.min(window.innerWidth, window.innerHeight);
+    return minDim <= 600;
+  }
+
+  isPortrait() {
+    return window.matchMedia('(orientation: portrait)').matches;
   }
 
   isPortraitTouch() {
     return window.matchMedia('(pointer: coarse) and (orientation: portrait)').matches;
+  }
+
+  // Apply phone-specific layout: trackpad mode always; cover+pan for portrait,
+  // contain (letterbox) for landscape so the entire screen is visible.
+  applyMobileLayout() {
+    const video = this.elements.videoElement;
+    if (!this.isPhone()) {
+      this.trackpadMode = false;
+      if (video) {
+        video.style.objectFit = '';
+        video.style.objectPosition = '';
+      }
+      return;
+    }
+
+    if (!this.trackpadMode) {
+      this.trackpadMode = true;
+      this.virtualCursorX = 32768;
+      this.virtualCursorY = 32768;
+    }
+
+    if (video) {
+      video.style.objectFit = this.isPortrait() ? 'cover' : 'contain';
+    }
+    this.updateCursorPan();
   }
 
   startInertia() {
@@ -1455,13 +1544,7 @@ class WebRTCVNC {
     if (this.elements.fullscreenBtn) this.elements.fullscreenBtn.classList.remove('hidden');
     if (this.elements.keyboardBtn) this.elements.keyboardBtn.classList.remove('hidden');
 
-    if (this.isTouchDevice() && this.isPortraitTouch()) {
-      this.trackpadMode = true;
-      this.virtualCursorX = 32768;
-      this.virtualCursorY = 32768;
-      const video = this.elements.videoElement;
-      if (video) { video.style.objectFit = 'cover'; video.style.objectPosition = '50% center'; }
-    }
+    this.applyMobileLayout();
 
     this.fetchEncoderInfo();
   }

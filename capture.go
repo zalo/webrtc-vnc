@@ -648,6 +648,14 @@ func (c *Capture) readH264Stream(ctx context.Context, reader io.Reader) {
 	writeCount := 0
 	lastLog := time.Now()
 
+	// Measure inter-frame intervals so pion's H.264 payloader can advance the
+	// RTP timestamp accurately even if FFmpeg's output rate jitters.
+	var lastFrameTime time.Time
+	defaultFrameDuration := time.Second / time.Duration(c.config.FPS)
+	if defaultFrameDuration <= 0 {
+		defaultFrameDuration = time.Second / 60
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -694,12 +702,19 @@ func (c *Capture) readH264Stream(ctx context.Context, reader io.Reader) {
 			sample = append(sample, 0x00, 0x00, 0x00, 0x01)
 			sample = append(sample, nal.Data...)
 
-			// Send via RTP (manual packetization, async) for media track
-			if sender := c.room.VideoSender(); sender != nil {
-				sender.SendFrame(sample, isIDR)
+			// Send via WebRTC media track (pion handles RTP packetization
+			// using its built-in optimized H.264 payloader).
+			now := time.Now()
+			frameDuration := defaultFrameDuration
+			if !lastFrameTime.IsZero() {
+				if d := now.Sub(lastFrameTime); d > 0 && d < time.Second {
+					frameDuration = d
+				}
 			}
-			// Also send via DataChannel for WebCodecs browsers
-			c.room.BroadcastVideoFrame(sample)
+			lastFrameTime = now
+			if err := c.room.WriteVideoSample(sample, frameDuration); err != nil {
+				// No peers connected — normal
+			}
 
 			writeCount++
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 var upgrader = websocket.Upgrader{
@@ -25,12 +26,10 @@ type Peer struct {
 	MouseEnabled    bool
 	GamepadSlots    map[int]bool // server gamepad slot → claimed
 
-	conn       *websocket.Conn
-	pc         *webrtc.PeerConnection
-	dc         *webrtc.DataChannel // input channel
-	videoDC    *webrtc.DataChannel // video frames channel
-	room       *Room
-	videoDCMode string // "reliable-ordered", "reliable-unordered", "unreliable-ordered", "unreliable-unordered"
+	conn *websocket.Conn
+	pc   *webrtc.PeerConnection
+	dc   *webrtc.DataChannel // input channel
+	room *Room
 }
 
 // Room manages the streaming session and all connected peers.
@@ -41,9 +40,8 @@ type Room struct {
 	input   *Input
 	capture *Capture
 
-	videoTrack    *webrtc.TrackLocalStaticRTP
-	audioTrack    *webrtc.TrackLocalStaticRTP
-	videoSender   *VideoRTPSender
+	videoTrack *webrtc.TrackLocalStaticSample
+	audioTrack *webrtc.TrackLocalStaticRTP
 
 	// Quality settings (controlled by host)
 	bitrate   int
@@ -63,7 +61,10 @@ type Room struct {
 }
 
 func NewRoom(input *Input) (*Room, error) {
-	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
+	// Sample-based video track: pion's media package handles H.264 RTP
+	// packetization (NAL splitting, FU-A fragmentation, sequence numbers,
+	// timestamps) using its optimized payloader.
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
 		"video", "screen",
 	)
@@ -93,75 +94,19 @@ func NewRoom(input *Input) (*Room, error) {
 	}, nil
 }
 
-// maxDCMessageSize is the max size for a single DataChannel message.
-// SCTP fragments larger messages, but some browsers have limits.
-// We chunk frames larger than this and the JS side reassembles them.
-const maxDCMessageSize = 64 * 1024 // 64KB
-
-// BroadcastVideoFrame sends an H.264 access unit to all connected peers
-// via data channels. Large frames are chunked with a simple protocol:
-//   - Chunk: [0x01][uint32 BE total_len][chunk_data...]
-//   - Complete small frame: [0x00][frame_data...]
-func (r *Room) BroadcastVideoFrame(data []byte) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	// Count active peers first
-	var activePeers []*Peer
-	for _, p := range r.peers {
-		if p.videoDC != nil && p.videoDC.ReadyState() == webrtc.DataChannelStateOpen {
-			activePeers = append(activePeers, p)
-		}
-	}
-	if len(activePeers) == 0 {
-		return false
-	}
-
-	// Build messages once, send to all peers
-	if len(data) <= maxDCMessageSize-1 {
-		msg := make([]byte, 1+len(data))
-		msg[0] = 0x00
-		copy(msg[1:], data)
-		for _, p := range activePeers {
-			p.videoDC.Send(msg)
-		}
-	} else {
-		totalLen := len(data)
-		for offset := 0; offset < totalLen; {
-			end := offset + maxDCMessageSize - 5
-			if end > totalLen {
-				end = totalLen
-			}
-			chunk := make([]byte, 5+(end-offset))
-			chunk[0] = 0x01
-			chunk[1] = byte(totalLen >> 24)
-			chunk[2] = byte(totalLen >> 16)
-			chunk[3] = byte(totalLen >> 8)
-			chunk[4] = byte(totalLen)
-			copy(chunk[5:], data[offset:end])
-			for _, p := range activePeers {
-				p.videoDC.Send(chunk)
-			}
-			offset = end
-		}
-	}
-	return true
-}
-
 func (r *Room) SetCapture(c *Capture) {
 	r.capture = c
 }
 
-func (r *Room) VideoTrack() *webrtc.TrackLocalStaticRTP {
+func (r *Room) VideoTrack() *webrtc.TrackLocalStaticSample {
 	return r.videoTrack
 }
 
-func (r *Room) VideoSender() *VideoRTPSender {
-	return r.videoSender
-}
-
-func (r *Room) InitVideoSender(fps int) {
-	r.videoSender = NewVideoRTPSender(r.videoTrack, fps)
+// WriteVideoSample feeds an H.264 access unit (Annex B with start codes)
+// to the WebRTC video track. Pion handles RTP packetization internally —
+// no manual sequence numbers, timestamps, or FU-A fragmentation needed.
+func (r *Room) WriteVideoSample(data []byte, duration time.Duration) error {
+	return r.videoTrack.WriteSample(media.Sample{Data: data, Duration: duration})
 }
 
 func (r *Room) AudioTrack() *webrtc.TrackLocalStaticRTP {
@@ -278,11 +223,6 @@ func (r *Room) handleJoin(conn *websocket.Conn, msg map[string]interface{}) {
 		slot = 1 // Host is always Player 1
 	}
 
-	videoDCMode, _ := msg["video_dc_mode"].(string)
-	if videoDCMode == "" {
-		videoDCMode = "reliable-ordered"
-	}
-
 	peer := &Peer{
 		ID:              peerID,
 		Name:            name,
@@ -291,7 +231,6 @@ func (r *Room) handleJoin(conn *websocket.Conn, msg map[string]interface{}) {
 		KeyboardEnabled: isHost || r.guestKeyboard,
 		MouseEnabled:    isHost || r.guestMouse,
 		GamepadSlots:    make(map[int]bool),
-		videoDCMode:     videoDCMode,
 		conn:            conn,
 		room:            r,
 	}
@@ -362,48 +301,23 @@ func (r *Room) setupPeerConnection(peer *Peer) {
 
 	peer.pc = pc
 
-	// Add both audio and video media tracks.
-	// Video track is the fallback for browsers without WebCodecs (iOS, Safari).
-	// Browsers with WebCodecs will use the unreliable data channel instead.
-	if _, err := pc.AddTrack(r.videoTrack); err != nil {
+	// Video and audio tracks. All browsers consume the same WebRTC media
+	// track — pion's optimized H.264 payloader handles RTP packetization.
+	videoSender, err := pc.AddTrack(r.videoTrack)
+	if err != nil {
 		log.Printf("Failed to add video track: %v", err)
 		return
 	}
-	if _, err := pc.AddTrack(r.audioTrack); err != nil {
+	audioSender, err := pc.AddTrack(r.audioTrack)
+	if err != nil {
 		log.Printf("Failed to add audio track: %v", err)
 		return
 	}
 
-	// Video data channel — reliability configured per peer
-	var videoDCInit *webrtc.DataChannelInit
-	switch peer.videoDCMode {
-	case "reliable-unordered":
-		ordered := false
-		videoDCInit = &webrtc.DataChannelInit{Ordered: &ordered}
-	case "unreliable-ordered":
-		maxRetransmits := uint16(0)
-		videoDCInit = &webrtc.DataChannelInit{MaxRetransmits: &maxRetransmits}
-	case "unreliable-unordered":
-		ordered := false
-		maxRetransmits := uint16(0)
-		videoDCInit = &webrtc.DataChannelInit{Ordered: &ordered, MaxRetransmits: &maxRetransmits}
-	default: // "reliable-ordered"
-		videoDCInit = nil
-	}
-	log.Printf("Video DC mode for %s: %s", peer.ID, peer.videoDCMode)
-	videoDC, err := pc.CreateDataChannel("video", videoDCInit)
-	if err != nil {
-		log.Printf("Failed to create video data channel: %v", err)
-		return
-	}
-	peer.videoDC = videoDC
-
-	videoDC.OnOpen(func() {
-		log.Printf("Video data channel open for peer %s, requesting IDR", peer.ID)
-		if r.capture != nil {
-			r.capture.RequestIDR()
-		}
-	})
+	// Drain incoming RTCP — required so pion processes NACK/PLI feedback
+	// and triggers the sender's built-in retransmission cache.
+	go drainRTCP(videoSender)
+	go drainRTCP(audioSender)
 
 	// Input: unreliable + unordered (same as Sunshine)
 	// Old input events are stale — we only care about latest mouse/key state.
@@ -421,7 +335,11 @@ func (r *Room) setupPeerConnection(peer *Peer) {
 	peer.dc = dc
 
 	dc.OnOpen(func() {
-		log.Printf("Input data channel open for peer %s", peer.ID)
+		log.Printf("Input data channel open for peer %s, requesting IDR", peer.ID)
+		// Force a keyframe so the new peer can decode immediately.
+		if r.capture != nil {
+			r.capture.RequestIDR()
+		}
 	})
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
@@ -936,6 +854,17 @@ func (r *Room) broadcastExcept(excludeID string, msg map[string]interface{}) {
 	for _, p := range r.peers {
 		if p.ID != excludeID {
 			sendJSON(p.conn, msg)
+		}
+	}
+}
+
+// drainRTCP reads and discards RTCP packets so pion's sender can act on
+// NACK / PLI / REMB feedback (it relies on Read being pumped).
+func drainRTCP(sender *webrtc.RTPSender) {
+	buf := make([]byte, 1500)
+	for {
+		if _, _, err := sender.Read(buf); err != nil {
+			return
 		}
 	}
 }

@@ -97,7 +97,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create room: %v", err)
 	}
-	room.InitVideoSender(*fps)
 
 	// Start screen capture
 	captureConfig := CaptureConfig{

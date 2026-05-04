@@ -85,8 +85,7 @@ Input injection (keyboard, mouse, gamepad) requires `/dev/uinput` access. Withou
 |------|---------|
 | `main.go` | HTTP server, flags, graceful shutdown |
 | `capture.go` | Screen capture + encoder detection, FFmpeg process management |
-| `stream.go` | WebRTC room, signaling, peer/input/quality management |
-| `rtp_sender.go` | H.264 → RTP packetization (RFC 6184 FU-A) |
+| `stream.go` | WebRTC room, signaling, peer/input/quality management; H.264 fed to pion via `TrackLocalStaticSample` |
 | `input.go` | `/dev/uinput` keyboard, mouse, gamepad injection |
 | `cmd/nvfbc/` | NVIDIA NvFBC capture helpers (optional, NVIDIA only) |
 | `web/` | Browser frontend |
