@@ -58,6 +58,17 @@ type Room struct {
 
 	// Gamepad slot allocation (0-3)
 	gamepadSlots [4]*Peer
+
+	// Optional WebSocket video transport (TCP fallback for restrictive
+	// networks). Each /ws-video subscriber receives Annex-B access units
+	// as binary frames and decodes them client-side via WebCodecs.
+	wsVideoMu   sync.RWMutex
+	wsVideoSubs map[*wsVideoSub]struct{}
+}
+
+type wsVideoSub struct {
+	ch      chan []byte
+	haveIDR bool
 }
 
 func NewRoom(input *Input) (*Room, error) {
@@ -86,12 +97,98 @@ func NewRoom(input *Input) (*Room, error) {
 		videoTrack:    videoTrack,
 		audioTrack:    audioTrack,
 		bitrate:       3000,
-		framerate:     60,
-		width:         1920,
-		height:        1080,
+		framerate:     144,
+		width:         854,
+		height:        480,
 		guestKeyboard: true,
 		guestMouse:    true,
+		wsVideoSubs:   make(map[*wsVideoSub]struct{}),
 	}, nil
+}
+
+// HandleVideoWebSocket upgrades an HTTP request to a WebSocket and streams
+// H.264 access units (Annex B) as binary frames. Used by clients that
+// opt into the TCP fallback transport instead of the WebRTC media track.
+func (r *Room) HandleVideoWebSocket(w http.ResponseWriter, req *http.Request) {
+	conn, err := upgrader.Upgrade(w, req, nil)
+	if err != nil {
+		log.Printf("WS-video upgrade error: %v", err)
+		return
+	}
+	log.Printf("WS-video subscriber from %s", conn.RemoteAddr())
+
+	sub := &wsVideoSub{ch: make(chan []byte, 32)}
+	r.wsVideoMu.Lock()
+	r.wsVideoSubs[sub] = struct{}{}
+	r.wsVideoMu.Unlock()
+
+	// Force a keyframe so the new subscriber's decoder can sync immediately.
+	if r.capture != nil {
+		r.capture.RequestIDR()
+	}
+
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for data := range sub.ch {
+			if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Drain reads so we notice when the client closes.
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+
+	r.wsVideoMu.Lock()
+	delete(r.wsVideoSubs, sub)
+	r.wsVideoMu.Unlock()
+	close(sub.ch)
+	<-writerDone
+	conn.Close()
+	log.Printf("WS-video subscriber disconnected")
+}
+
+// BroadcastWSVideoFrame fans out an H.264 access unit to every /ws-video
+// subscriber. Subscribers that haven't received an IDR yet skip non-IDR
+// frames. When a subscriber's send queue is full we drop the frame AND
+// reset its IDR flag — without a fresh keyframe the decoder would render
+// garbage off a missing reference, so we ask the encoder for one.
+func (r *Room) BroadcastWSVideoFrame(data []byte, isIDR bool) {
+	r.wsVideoMu.RLock()
+	defer r.wsVideoMu.RUnlock()
+
+	if len(r.wsVideoSubs) == 0 {
+		return
+	}
+
+	cp := make([]byte, len(data))
+	copy(cp, data)
+
+	needIDR := false
+	for sub := range r.wsVideoSubs {
+		if !sub.haveIDR {
+			if !isIDR {
+				continue
+			}
+			sub.haveIDR = true
+		}
+		select {
+		case sub.ch <- cp:
+		default:
+			sub.haveIDR = false
+			needIDR = true
+		}
+	}
+
+	if needIDR && r.capture != nil {
+		log.Printf("WS-video: subscriber backpressure, requesting IDR")
+		r.capture.RequestIDR()
+	}
 }
 
 func (r *Room) SetCapture(c *Capture) {

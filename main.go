@@ -55,9 +55,9 @@ var webFiles embed.FS
 func main() {
 	port := flag.Int("port", 8080, "HTTP server port")
 	display := flag.String("display", "", "X11 display (default: $DISPLAY)")
-	width := flag.Int("width", 1920, "Capture width")
-	height := flag.Int("height", 1080, "Capture height")
-	fps := flag.Int("fps", 60, "Capture framerate")
+	width := flag.Int("width", 854, "Capture width")
+	height := flag.Int("height", 480, "Capture height")
+	fps := flag.Int("fps", 144, "Capture framerate")
 	bitrate := flag.Int("bitrate", 3000, "Video bitrate in kbps")
 	encoder := flag.String("encoder", "auto", "Video encoder: auto, nvenc, vaapi, software")
 	noAudio := flag.Bool("no-audio", false, "Disable audio capture")
@@ -125,6 +125,9 @@ func main() {
 
 	// WebSocket signaling endpoint
 	mux.HandleFunc("/ws", room.HandleWebSocket)
+
+	// Optional WebSocket video transport (opt-in TCP fallback)
+	mux.HandleFunc("/ws-video", room.HandleVideoWebSocket)
 
 	// API endpoints
 	mux.HandleFunc("/api/encoder", func(w http.ResponseWriter, r *http.Request) {

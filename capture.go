@@ -715,6 +715,8 @@ func (c *Capture) readH264Stream(ctx context.Context, reader io.Reader) {
 			if err := c.room.WriteVideoSample(sample, frameDuration); err != nil {
 				// No peers connected — normal
 			}
+			// Also fan out to any /ws-video subscribers (TCP fallback path).
+			c.room.BroadcastWSVideoFrame(sample, isIDR)
 
 			writeCount++
 

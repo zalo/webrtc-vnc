@@ -112,15 +112,17 @@ class WebRTCVNC {
       connectionStatus: document.getElementById('connectionStatus'),
       allowKeyboard: document.getElementById('allowKeyboard'),
       allowMouse: document.getElementById('allowMouse'),
-      consoleLog: document.getElementById('consoleLog'),
-      videoPathToggle: document.getElementById('videoPathToggle'),
-      videoPathLabel: document.getElementById('videoPathLabel')
+      consoleLog: document.getElementById('consoleLog')
     };
 
     // Video path: server only offers the WebRTC media track now.
     // The legacy WebCodecs-over-DataChannel path is gone.
     this.useDataChannel = false;
     this.videoDCMode = 'reliable-ordered';
+
+    // Optional WebSocket video transport (TCP fallback). Persisted preference.
+    this.useWSVideo = localStorage.getItem('webrtcVncWSVideo') === 'true';
+    this._wsVideo = null; // active socket (when on)
 
     // Console capture is done inline in index.html before this script loads
     this.bindEvents();
@@ -245,27 +247,14 @@ class WebRTCVNC {
       this.elements.videoElement.addEventListener('resize', () => this.applyMobileLayout());
     }
 
-    // Video DC reliability dropdown
-    var videoDCSelect = document.getElementById('videoDCMode');
-    if (videoDCSelect) {
-      videoDCSelect.value = this.videoDCMode;
-      videoDCSelect.addEventListener('change', (e) => {
-        this.videoDCMode = e.target.value;
-        localStorage.setItem('webrtcVncDCMode', this.videoDCMode);
-        console.log('Video DC mode changed to: ' + this.videoDCMode + ' (reconnect to apply)');
-        this.showNotification('Reconnect to apply DC mode change');
-      });
-    }
-
-    // Video path toggle
-    if (this.elements.videoPathToggle) {
-      this.elements.videoPathToggle.checked = this.useDataChannel;
-      this.updateVideoPathLabel();
-      this.elements.videoPathToggle.addEventListener('change', (e) => {
-        this.useDataChannel = e.target.checked;
-        localStorage.setItem('webrtcVncDC', this.useDataChannel ? 'true' : 'false');
-        this.updateVideoPathLabel();
-        this.switchVideoPath();
+    // WebSocket video toggle (TCP fallback)
+    var wsToggle = document.getElementById('wsVideoToggle');
+    if (wsToggle) {
+      wsToggle.checked = this.useWSVideo;
+      wsToggle.addEventListener('change', (e) => {
+        this.useWSVideo = e.target.checked;
+        localStorage.setItem('webrtcVncWSVideo', this.useWSVideo ? 'true' : 'false');
+        this.applyWSVideoState();
       });
     }
 
@@ -1433,6 +1422,251 @@ class WebRTCVNC {
     this.pointerLocked = document.pointerLockElement === this.elements.videoElement;
   }
 
+  // ============== WebSocket Video Transport (opt-in TCP fallback) ==============
+
+  applyWSVideoState() {
+    if (this.useWSVideo) this.setupWebSocketVideo();
+    else this.teardownWebSocketVideo();
+  }
+
+  setupWebSocketVideo() {
+    if (this._wsVideo) return;
+    if (typeof VideoDecoder === 'undefined' || typeof EncodedVideoChunk === 'undefined') {
+      console.warn('WebCodecs unavailable — falling back to WebRTC media track');
+      this.useWSVideo = false;
+      const tog = document.getElementById('wsVideoToggle');
+      if (tog) tog.checked = false;
+      return;
+    }
+
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${wsProto}//${window.location.host}/ws-video`;
+    console.log('WS video: connecting to ' + url);
+
+    const canvas = document.createElement('canvas');
+    canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;z-index:1;pointer-events:none;background:#000';
+    this.elements.videoContainer.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+    this._wsCanvas = canvas;
+
+    // Make the WebRTC <video> invisible but still hit-testable.
+    // `visibility: hidden` would block pointer events on the element where
+    // our pointermove/down/up handlers are attached, so use opacity instead.
+    const video = this.elements.videoElement;
+    if (video) video.style.opacity = '0';
+
+    const self = this;
+    let configured = false;
+    let decCount = 0, recvCount = 0, renderCount = 0, idrCount = 0;
+    let lastLog = Date.now();
+    let latestFrame = null;
+    let latestFrameW = 0, latestFrameH = 0;
+    let drawScheduled = false;
+
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        if (latestFrame) latestFrame.close();
+        latestFrame = frame;
+        latestFrameW = frame.displayWidth;
+        latestFrameH = frame.displayHeight;
+        if (!drawScheduled) {
+          drawScheduled = true;
+          requestAnimationFrame(() => {
+            drawScheduled = false;
+            if (!latestFrame) return;
+            const cw = canvas.clientWidth || latestFrameW;
+            const ch = canvas.clientHeight || latestFrameH;
+            if (canvas.width !== cw || canvas.height !== ch) {
+              canvas.width = cw; canvas.height = ch;
+            }
+            const va = latestFrameW / latestFrameH;
+            const ca = cw / ch;
+            let dw, dh, dx, dy;
+
+            if (self.trackpadMode && self.isPortrait()) {
+              // Portrait phone: cover + pan to keep cursor centered.
+              dh = ch; dw = ch * va; dy = 0;
+              const visibleFrac = (cw / dw);
+              const cx = self.virtualCursorX / 65535;
+              let p = visibleFrac < 1 ? (cx - visibleFrac / 2) / (1 - visibleFrac) : 0.5;
+              p = Math.max(0, Math.min(1, p));
+              dx = -(dw - cw) * p;
+            } else if (va > ca) {
+              dw = cw; dh = cw / va; dx = 0; dy = (ch - dh) / 2;
+            } else {
+              dh = ch; dw = ch * va; dy = 0; dx = (cw - dw) / 2;
+            }
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, cw, ch);
+            ctx.drawImage(latestFrame, dx, dy, dw, dh);
+            latestFrame.close();
+            latestFrame = null;
+            renderCount++;
+            self._wsLastRender = Date.now();
+          });
+        }
+      },
+      error: (e) => console.error('WS video: decoder error: ' + (e.message || e.name || String(e)))
+    });
+
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    this._wsVideo = ws;
+
+    ws.onopen = () => {
+      console.log('WS video: connected');
+      this._wsLastRender = Date.now();
+      // Freeze detector: if no frame renders for >1s, ask for a fresh IDR.
+      this._wsFreezeTimer = setInterval(() => {
+        if (!this._wsVideo) return;
+        const since = Date.now() - (this._wsLastRender || 0);
+        if (since > 1000 && (!this._wsLastIDRReq || Date.now() - this._wsLastIDRReq > 1500)) {
+          console.log('WS video: no frame in ' + since + 'ms, requesting IDR');
+          this.sendSignaling('request_idr');
+          this._wsLastIDRReq = Date.now();
+        }
+      }, 500);
+    };
+    ws.onclose = () => {
+      console.log('WS video: closed');
+      if (decoder.state !== 'closed') decoder.close();
+      if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
+      if (this._wsCanvas === canvas) this._wsCanvas = null;
+      if (this._wsVideo === ws) this._wsVideo = null;
+      const v = this.elements.videoElement;
+      if (v && this.useWSVideo === false) v.style.opacity = '';
+    };
+    ws.onerror = (e) => console.warn('WS video: error');
+
+    ws.onmessage = (e) => {
+      if (decoder.state === 'closed') return;
+      const data = new Uint8Array(e.data);
+      recvCount++;
+      if (data.length < 5) return;
+
+      // Scan Annex B for NAL types we care about.
+      let hasIDR = false, hasSPS = false, hasPPS = false;
+      let spsNal = null, ppsNal = null;
+      const scanNals = () => {
+        for (let i = 0; i <= data.length - 5; i++) {
+          if (data[i] === 0 && data[i+1] === 0 && data[i+2] === 0 && data[i+3] === 1) {
+            const nt = data[i+4] & 0x1F;
+            if (nt === 5) hasIDR = true;
+            if (nt === 7 || nt === 8) {
+              let end = data.length;
+              for (let j = i+5; j <= data.length - 4; j++) {
+                if (data[j] === 0 && data[j+1] === 0 && data[j+2] === 0 && data[j+3] === 1) { end = j; break; }
+              }
+              let nal = data.subarray(i+4, end);
+              while (nal.length > 0 && nal[nal.length-1] === 0) nal = nal.subarray(0, nal.length-1);
+              if (nt === 7) { hasSPS = true; spsNal = nal; }
+              else { hasPPS = true; ppsNal = nal; }
+            }
+          }
+        }
+      };
+      scanNals();
+
+      if (!configured && spsNal && ppsNal && hasIDR) {
+        const codec = 'avc1.' +
+          ('0' + spsNal[1].toString(16)).slice(-2) +
+          ('0' + spsNal[2].toString(16)).slice(-2) +
+          ('0' + spsNal[3].toString(16)).slice(-2);
+        const desc = new Uint8Array(11 + spsNal.length + ppsNal.length);
+        desc[0] = 1; desc[1] = spsNal[1]; desc[2] = spsNal[2]; desc[3] = spsNal[3];
+        desc[4] = 0xFF; desc[5] = 0xE1;
+        desc[6] = (spsNal.length >> 8) & 0xFF; desc[7] = spsNal.length & 0xFF;
+        desc.set(spsNal, 8);
+        const o = 8 + spsNal.length;
+        desc[o] = 1; desc[o+1] = (ppsNal.length >> 8) & 0xFF; desc[o+2] = ppsNal.length & 0xFF;
+        desc.set(ppsNal, o + 3);
+        try {
+          decoder.configure({ codec, description: desc.buffer, optimizeForLatency: true });
+          configured = true;
+          console.log('WS video: configured ' + codec);
+        } catch (err) {
+          console.error('WS video: configure failed: ' + err.message);
+          return;
+        }
+      }
+      if (!configured) return;
+      if (decCount === 0 && !hasIDR) return;
+
+      // Convert Annex B VCL NALs to AVCC framing for WebCodecs.
+      const vcl = [];
+      for (let i = 0; i <= data.length - 5; i++) {
+        if (data[i] === 0 && data[i+1] === 0 && data[i+2] === 0 && data[i+3] === 1) {
+          const nt = data[i+4] & 0x1F;
+          if (nt >= 1 && nt <= 5) {
+            let end = data.length;
+            for (let j = i+5; j <= data.length - 4; j++) {
+              if (data[j] === 0 && data[j+1] === 0 && data[j+2] === 0 && data[j+3] === 1) { end = j; break; }
+            }
+            while (end > i+5 && data[end-1] === 0) end--;
+            vcl.push(data.subarray(i+4, end));
+          }
+        }
+      }
+      if (vcl.length === 0) return;
+      let total = 0;
+      for (const v of vcl) total += 4 + v.length;
+      const buf = new Uint8Array(total);
+      let pos = 0;
+      for (const v of vcl) {
+        const len = v.length;
+        buf[pos] = (len >>> 24) & 0xFF;
+        buf[pos+1] = (len >>> 16) & 0xFF;
+        buf[pos+2] = (len >>> 8) & 0xFF;
+        buf[pos+3] = len & 0xFF;
+        buf.set(v, pos + 4);
+        pos += 4 + len;
+      }
+
+      const now = Date.now();
+      if (hasIDR) idrCount++;
+      if (now - lastLog > 5000) {
+        const el = (now - lastLog) / 1000;
+        console.log('WS: recv=' + Math.round(recvCount/el) +
+          ' dec=' + Math.round(decCount/el) +
+          ' render=' + Math.round(renderCount/el) +
+          ' idr=' + idrCount +
+          ' q=' + decoder.decodeQueueSize);
+        recvCount = 0; decCount = 0; renderCount = 0; idrCount = 0; lastLog = now;
+      }
+
+      try {
+        if (decoder.decodeQueueSize > 10) return;
+        decoder.decode(new EncodedVideoChunk({
+          type: hasIDR ? 'key' : 'delta',
+          timestamp: decCount * (1000000 / 144),
+          data: buf.buffer
+        }));
+        decCount++;
+      } catch (err) {
+        console.warn('WS decode: ' + (err.message || err));
+        configured = false;
+        decCount = 0;
+      }
+    };
+  }
+
+  teardownWebSocketVideo() {
+    if (this._wsFreezeTimer) {
+      clearInterval(this._wsFreezeTimer);
+      this._wsFreezeTimer = null;
+    }
+    if (this._wsVideo) {
+      try { this._wsVideo.close(); } catch {}
+      this._wsVideo = null;
+    }
+    if (this._wsCanvas && this._wsCanvas.parentNode) {
+      this._wsCanvas.parentNode.removeChild(this._wsCanvas);
+    }
+    this._wsCanvas = null;
+    const video = this.elements.videoElement;
+    if (video) video.style.opacity = '';
+  }
+
   // ============== Stats ==============
 
   startStatsPolling() {
@@ -1545,6 +1779,7 @@ class WebRTCVNC {
     if (this.elements.keyboardBtn) this.elements.keyboardBtn.classList.remove('hidden');
 
     this.applyMobileLayout();
+    this.applyWSVideoState();
 
     this.fetchEncoderInfo();
   }
@@ -1634,38 +1869,6 @@ class WebRTCVNC {
   }
 
   toggleSidebar() { this.elements.sidebar?.classList.toggle('open'); }
-
-  updateVideoPathLabel() {
-    if (this.elements.videoPathLabel) {
-      this.elements.videoPathLabel.textContent = this.useDataChannel
-        ? 'DataChannel (low latency)'
-        : 'Media Track (compatible)';
-    }
-  }
-
-  switchVideoPath() {
-    if (this.useDataChannel) {
-      // Activate DC path: set up decoder if DC exists but wasn't initialized
-      if (this._videoDC && !this._videoCanvas) {
-        this.setupVideoDataChannel(this._videoDC);
-      }
-      if (this._videoCanvas) {
-        this._videoCanvas.style.display = '';
-      }
-      console.log('Switched to DataChannel video path');
-    } else {
-      // Activate media track path: hide canvas, video element shows through
-      if (this._videoCanvas) {
-        this._videoCanvas.style.display = 'none';
-      }
-      // Clean up decoder to free resources
-      if (this._videoDecoder && this._videoDecoder.state !== 'closed') {
-        this._videoDecoder.close();
-        this._videoDecoder = null;
-      }
-      console.log('Switched to Media Track video path');
-    }
-  }
 
   toggleFullscreen() {
     if (document.fullscreenElement) document.exitFullscreen();
@@ -1850,6 +2053,7 @@ class WebRTCVNC {
     if (this.dataChannel) { this.dataChannel.close(); this.dataChannel = null; }
     if (this.pc) { this.pc.close(); this.pc = null; }
     if (this.ws) { this.ws.close(); this.ws = null; }
+    this.teardownWebSocketVideo();
 
     this.trackpadMode = false;
     this.gestureState = 'idle';

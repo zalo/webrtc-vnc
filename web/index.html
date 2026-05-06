@@ -586,17 +586,17 @@
                     <label for="framerateSelect">Framerate</label>
                     <select id="framerateSelect" class="quality-select">
                         <option value="30">30 FPS</option>
-                        <option value="60" selected>60 FPS</option>
+                        <option value="60">60 FPS</option>
                         <option value="120">120 FPS</option>
-                        <option value="144">144 FPS</option>
+                        <option value="144" selected>144 FPS</option>
                     </select>
                 </div>
                 <div class="quality-setting">
                     <label for="resolutionSelect">Resolution</label>
                     <select id="resolutionSelect" class="quality-select">
-                        <option value="480">480p (854x480)</option>
+                        <option value="480" selected>480p (854x480)</option>
                         <option value="720">720p (1280x720)</option>
-                        <option value="1080" selected>1080p (1920x1080)</option>
+                        <option value="1080">1080p (1920x1080)</option>
                         <option value="1440">1440p (2560x1440)</option>
                         <option value="4k">4K (3840x2160)</option>
                     </select>
@@ -633,23 +633,14 @@
             <div class="sidebar-section">
                 <h3>Transport</h3>
                 <div class="permission-item">
-                    <span id="videoPathLabel">DC Video (low latency)</span>
+                    <span>WebSocket video (fallback)</span>
                     <label class="toggle-switch">
-                        <input type="checkbox" id="videoPathToggle" checked>
+                        <input type="checkbox" id="wsVideoToggle">
                         <span class="toggle-slider"></span>
                     </label>
                 </div>
-                <div style="margin-top:0.5rem">
-                    <label style="font-size:0.75rem;color:var(--text-secondary)">Video DC Reliability</label>
-                    <select id="videoDCMode" style="width:100%;margin-top:0.25rem;padding:0.3rem;border-radius:4px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);font-size:0.8rem">
-                        <option value="reliable-ordered">Reliable + Ordered</option>
-                        <option value="reliable-unordered">Reliable + Unordered</option>
-                        <option value="unreliable-ordered">Unreliable + Ordered</option>
-                        <option value="unreliable-unordered">Unreliable + Unordered</option>
-                    </select>
-                </div>
                 <div style="margin-top:0.5rem;font-size:0.7rem;color:var(--text-secondary)">
-                    Input: unreliable + unordered (always)
+                    Default uses WebRTC media track. Toggle to stream H.264 over WebSocket (TCP) when WebRTC is blocked.
                 </div>
             </div>
 
