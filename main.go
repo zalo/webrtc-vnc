@@ -58,7 +58,7 @@ func main() {
 	width := flag.Int("width", 854, "Capture width")
 	height := flag.Int("height", 480, "Capture height")
 	fps := flag.Int("fps", 144, "Capture framerate")
-	bitrate := flag.Int("bitrate", 3000, "Video bitrate in kbps")
+	bitrate := flag.Int("bitrate", 1000, "Video bitrate in kbps")
 	encoder := flag.String("encoder", "auto", "Video encoder: auto, nvenc, vaapi, software")
 	noAudio := flag.Bool("no-audio", false, "Disable audio capture")
 	flag.Parse()
@@ -125,9 +125,6 @@ func main() {
 
 	// WebSocket signaling endpoint
 	mux.HandleFunc("/ws", room.HandleWebSocket)
-
-	// Optional WebSocket video transport (opt-in TCP fallback)
-	mux.HandleFunc("/ws-video", room.HandleVideoWebSocket)
 
 	// API endpoints
 	mux.HandleFunc("/api/encoder", func(w http.ResponseWriter, r *http.Request) {

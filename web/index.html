@@ -579,8 +579,8 @@
             <div class="sidebar-section" id="qualityPanel" style="display: none;">
                 <h3>Stream Quality</h3>
                 <div class="quality-setting">
-                    <label for="bitrateSlider">Bitrate: <span id="bitrateValue">3</span> Mbps</label>
-                    <input type="range" id="bitrateSlider" min="1" max="50" value="3" class="quality-slider">
+                    <label for="bitrateSlider">Bitrate: <span id="bitrateValue">1</span> Mbps</label>
+                    <input type="range" id="bitrateSlider" min="1" max="50" value="1" class="quality-slider">
                 </div>
                 <div class="quality-setting">
                     <label for="framerateSelect">Framerate</label>
@@ -630,19 +630,6 @@
                 </div>
             </div>
 
-            <div class="sidebar-section">
-                <h3>Transport</h3>
-                <div class="permission-item">
-                    <span>WebSocket video (fallback)</span>
-                    <label class="toggle-switch">
-                        <input type="checkbox" id="wsVideoToggle">
-                        <span class="toggle-slider"></span>
-                    </label>
-                </div>
-                <div style="margin-top:0.5rem;font-size:0.7rem;color:var(--text-secondary)">
-                    Default uses WebRTC media track. Toggle to stream H.264 over WebSocket (TCP) when WebRTC is blocked.
-                </div>
-            </div>
 
             <div class="sidebar-section">
                 <h3 style="display:flex;justify-content:space-between;align-items:center">Console <button id="copyLogsBtn" style="font-size:0.7rem;padding:2px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg-tertiary);color:var(--text-secondary);cursor:pointer">Copy</button></h3>
