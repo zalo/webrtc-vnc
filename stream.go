@@ -3,11 +3,14 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 )
@@ -42,6 +45,12 @@ type Room struct {
 
 	videoTrack *webrtc.TrackLocalStaticSample
 	audioTrack *webrtc.TrackLocalStaticRTP
+
+	// webrtcAPI bundles a SettingEngine that filters out unhelpful
+	// network interfaces (docker/veth/etc) and disables mDNS
+	// publication, so every PeerConnection inherits the same shaped
+	// candidate-gathering policy.
+	webrtcAPI *webrtc.API
 
 	// Quality settings (controlled by host)
 	bitrate   int
@@ -80,6 +89,8 @@ func NewRoom(input *Input) (*Room, error) {
 		return nil, err
 	}
 
+	api := buildWebRTCAPI()
+
 	return &Room{
 		peers:         make(map[string]*Peer),
 		input:         input,
@@ -91,7 +102,46 @@ func NewRoom(input *Input) (*Room, error) {
 		height:        480,
 		guestKeyboard: true,
 		guestMouse:    true,
+		webrtcAPI:     api,
 	}, nil
+}
+
+// buildWebRTCAPI returns a pion API configured with our candidate-shaping
+// policy: skip virtual/container interfaces (docker, veth, br-, cni,
+// virbr, link-local) so we don't publish host candidates the client
+// can't reach, and disable mDNS publication entirely so the candidates
+// we do publish are real routable IPs. ICE-restart on regression
+// (handleICERestart, client checkPathQuality) handles the case where a
+// nominated path later goes bad — these settings just shape the initial
+// candidate set so nomination converges on a real path the first time.
+func buildWebRTCAPI() *webrtc.API {
+	se := webrtc.SettingEngine{}
+
+	se.SetInterfaceFilter(func(name string) bool {
+		switch {
+		case name == "lo",
+			strings.HasPrefix(name, "docker"),
+			strings.HasPrefix(name, "br-"),
+			strings.HasPrefix(name, "veth"),
+			strings.HasPrefix(name, "cni"),
+			strings.HasPrefix(name, "virbr"),
+			strings.HasPrefix(name, "vmnet"),
+			strings.HasPrefix(name, "vboxnet"):
+			return false
+		}
+		return true
+	})
+
+	se.SetIPFilter(func(ip net.IP) bool {
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return false
+		}
+		return true
+	})
+
+	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+
+	return webrtc.NewAPI(webrtc.WithSettingEngine(se))
 }
 
 func (r *Room) SetCapture(c *Capture) {
@@ -295,7 +345,7 @@ func (r *Room) setupPeerConnection(peer *Peer) {
 		},
 	}
 
-	pc, err := webrtc.NewPeerConnection(config)
+	pc, err := r.webrtcAPI.NewPeerConnection(config)
 	if err != nil {
 		log.Printf("Failed to create PeerConnection for %s: %v", peer.ID, err)
 		return
@@ -428,13 +478,24 @@ func (r *Room) handleICE(conn *websocket.Conn, msg map[string]interface{}) {
 		sdpMLineIndex = uint16(idx)
 	}
 
-	ice := webrtc.ICECandidateInit{
+	// Drop mDNS-anonymized host candidates from Chrome/Edge. If
+	// multicast DNS is filtered on the network (corporate AP, client
+	// isolation, certain mesh routers), pion can't resolve the .local
+	// name and the connectivity check on that pair times out — pushing
+	// nomination toward srflx/relay paths that are noticeably worse.
+	// The browser also offers a non-mDNS srflx candidate for the same
+	// interface, so dropping these costs us nothing.
+	if strings.Contains(candidate, ".local") {
+		return
+	}
+
+	cand := webrtc.ICECandidateInit{
 		Candidate:     candidate,
 		SDPMid:        &sdpMid,
 		SDPMLineIndex: &sdpMLineIndex,
 	}
 
-	if err := peer.pc.AddICECandidate(ice); err != nil {
+	if err := peer.pc.AddICECandidate(cand); err != nil {
 		log.Printf("Failed to add ICE candidate for %s: %v", peer.ID, err)
 	}
 }
