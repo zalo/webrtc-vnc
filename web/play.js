@@ -1504,6 +1504,17 @@ class WebRTCVNC {
   }
 
   checkForFreeze(framesDecoded, now) {
+    // After a reconnect the RTCPeerConnection's framesDecoded restarts
+    // from 0 while lastFrameCount still holds the old session's count,
+    // so a `>` comparison would never fire and the detector would loop.
+    // Treat any backwards jump as a fresh stream and reset.
+    if (framesDecoded < this.freezeDetection.lastFrameCount) {
+      this.freezeDetection.lastFrameCount = framesDecoded;
+      this.freezeDetection.freezeStartTime = null;
+      this.freezeDetection.idrRequested = false;
+      this.freezeDetection.reconnectAttempted = false;
+      return;
+    }
     if (framesDecoded > this.freezeDetection.lastFrameCount) {
       this.freezeDetection.lastFrameCount = framesDecoded;
       this.freezeDetection.freezeStartTime = null;
@@ -1571,13 +1582,13 @@ class WebRTCVNC {
   updateRoomUI() {
     this.updatePlayerList();
     if (this.elements.joinPlayerSection) {
-      this.elements.joinPlayerSection.style.display = this.playerSlot === 0 ? 'block' : 'none';
+      this.elements.joinPlayerSection.style.display = this.playerSlot === 0 ? '' : 'none';
     }
     if (this.elements.permissionsPanel) {
-      this.elements.permissionsPanel.style.display = this.isHost ? 'block' : 'none';
+      this.elements.permissionsPanel.style.display = this.isHost ? '' : 'none';
     }
     if (this.elements.qualityPanel) {
-      this.elements.qualityPanel.style.display = this.isHost ? 'block' : 'none';
+      this.elements.qualityPanel.style.display = this.isHost ? '' : 'none';
     }
     if (this.playerSlot > 0) this.startGamepadPolling();
   }
@@ -1825,6 +1836,21 @@ class WebRTCVNC {
     if (this.dataChannel) { this.dataChannel.close(); this.dataChannel = null; }
     if (this.pc) { this.pc.close(); this.pc = null; }
     if (this.ws) { this.ws.close(); this.ws = null; }
+
+    // Per-session detector / stats state must reset so the next session
+    // starts with fresh baselines (the new pc's counters start at 0).
+    this.freezeDetection = {
+      lastFrameCount: 0, freezeStartTime: null,
+      idrRequested: false, reconnectAttempted: false
+    };
+    this._iceWindow = [];
+    this._iceLastRestart = 0;
+    this._lastJbReset = 0;
+    this.stats = {
+      bitrate: 0, fps: 0, rtt: 0, packetsLost: 0,
+      framesDecoded: 0, lastStatsTime: 0,
+      lastBytesReceived: 0, lastFramesDecoded: 0
+    };
 
     this.trackpadMode = false;
     this.gestureState = 'idle';
