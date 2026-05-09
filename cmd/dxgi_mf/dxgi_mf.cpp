@@ -33,6 +33,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
+#include <mferror.h>
 #include <codecapi.h>
 #include <wmcodecdsp.h>
 #include <io.h>
