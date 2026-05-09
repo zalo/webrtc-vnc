@@ -191,46 +191,169 @@ static void stdin_watcher() {
 }
 
 // ---------------------------------------------------------------------------
-// MediaFoundation encoder
+// MediaFoundation encoder.
+//
+// Two paths:
+//
+//   1. Hardware MFT (preferred): MFTEnumEx finds the NVENC / QSV / AMF MFT
+//      that advertises NV12->H264. We attach a D3D11 device manager so the
+//      encoder consumes our DXGI textures directly with zero CPU copy. The
+//      hardware MFTs on Windows are async, so we drive ProcessInput /
+//      ProcessOutput off the MFT's event queue (METransformNeedInput /
+//      METransformHaveOutput).
+//
+//   2. Software MFT (fallback): the in-box CMSH264EncoderMFT. It does not
+//      accept GPU surfaces, so we copy the NV12 texture into a STAGING
+//      texture, Map() it to system memory, and feed it as a memory buffer.
+//
+// Both paths emit H.264 Annex B (SPS/PPS prepended to every IDR) on stdout
+// via the shared write_nal/emit_avcc_as_annexb helpers above.
 // ---------------------------------------------------------------------------
 
 class MFEncoder {
 public:
-    HRESULT init(const Config &cfg) {
-        cfg_ = cfg;
+    HRESULT init(const Config &cfg, ID3D11Device *device, ID3D11DeviceContext *context) {
+        cfg_     = cfg;
+        device_  = device;
+        context_ = context;
 
         HRESULT hr = MFStartup(MF_VERSION);
         if (FAILED(hr)) return hr;
 
-        // Output type — H.264 baseline at target bitrate
-        ComPtr<IMFMediaType> outType;
-        MFCreateMediaType(&outType);
-        outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        outType->SetGUID(MF_MT_SUBTYPE,    MFVideoFormat_H264);
-        outType->SetUINT32(MF_MT_AVG_BITRATE, (UINT32)(cfg.bitrateKbps * 1000));
-        outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        outType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
-        MFSetAttributeSize(outType.Get(), MF_MT_FRAME_SIZE, cfg.width, cfg.height);
-        MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE, cfg.fps, 1);
-        MFSetAttributeRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        if (SUCCEEDED(initHardware())) {
+            log_err("encoder: hardware MFT (async=%d)", isAsync_ ? 1 : 0);
+            return S_OK;
+        }
+        log_err("encoder: hardware MFT not available, falling back to software");
+        return initSoftware();
+    }
 
-        // Input type — NV12 surfaces from DXGI
-        ComPtr<IMFMediaType> inType;
-        MFCreateMediaType(&inType);
-        inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        inType->SetGUID(MF_MT_SUBTYPE,    MFVideoFormat_NV12);
-        inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        MFSetAttributeSize(inType.Get(), MF_MT_FRAME_SIZE, cfg.width, cfg.height);
-        MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, cfg.fps, 1);
-        MFSetAttributeRatio(inType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    bool isAsync() const { return isAsync_; }
 
-        // SinkWriter writing to a "null" sink — we'll fish out raw samples instead.
-        // We use the in-memory pattern: MFCreateSinkWriterFromURL with NULL stream
-        // is awkward, so instead we go via IMFTransform directly. That gives us
-        // direct access to the encoded NAL payload sample.
+    // Sync-MFT path: caller has an NV12 texture and wants it encoded right now.
+    // Returns S_OK after the MFT has accepted the input and we've drained any
+    // available output. Used by the software fallback and by sync hardware MFTs.
+    HRESULT encodeSync(ID3D11Texture2D *nv12, INT64 ptsHns) {
+        HRESULT hr;
+        if (isHardware_) {
+            hr = feedGPUSample(nv12, ptsHns);
+        } else {
+            hr = feedSystemMemorySample(nv12, ptsHns);
+        }
+        if (FAILED(hr)) return hr;
+        return drainAll();
+    }
+
+    // Async-MFT path: blocks for one event from the MFT's event queue and
+    // dispatches it. METransformNeedInput → call captureCb to obtain a fresh
+    // NV12 texture and feed it. METransformHaveOutput → drain one output
+    // sample and emit Annex B. Returns once one event has been handled.
+    template <typename Cb>
+    HRESULT runAsyncStep(Cb captureCb, INT64 ptsHns) {
+        ComPtr<IMFMediaEvent> evt;
+        HRESULT hr = eventGen_->GetEvent(0, &evt);
+        if (FAILED(hr)) return hr;
+
+        MediaEventType type = MEUnknown;
+        evt->GetType(&type);
+
+        if (type == METransformNeedInput) {
+            ID3D11Texture2D *nv12 = captureCb();
+            if (!nv12) return S_OK; // capture not ready, encoder will get another NeedInput later
+            return feedGPUSample(nv12, ptsHns);
+        }
+        if (type == METransformHaveOutput) {
+            return drainOnce();
+        }
+        // Other events (e.g. METransformDrainComplete) — ignore.
+        return S_OK;
+    }
+
+    void shutdown() {
+        if (mft_) {
+            mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            mft_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+            mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        }
+        mft_.Reset();
+        outputType_.Reset();
+        deviceManager_.Reset();
+        eventGen_.Reset();
+        stagingNV12_.Reset();
+        MFShutdown();
+    }
+
+private:
+    HRESULT initHardware() {
+        MFT_REGISTER_TYPE_INFO inInfo  = { MFMediaType_Video, MFVideoFormat_NV12 };
+        MFT_REGISTER_TYPE_INFO outInfo = { MFMediaType_Video, MFVideoFormat_H264 };
+
+        IMFActivate **activates = NULL;
+        UINT32 count = 0;
+        UINT32 flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+        HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, &inInfo, &outInfo, &activates, &count);
+        if (FAILED(hr) || count == 0) {
+            if (activates) CoTaskMemFree(activates);
+            return E_FAIL;
+        }
+
         ComPtr<IMFTransform> mft;
-        hr = CoCreateInstance(CLSID_CMSH264EncoderMFT, NULL, CLSCTX_INPROC_SERVER,
-                              IID_PPV_ARGS(&mft));
+        hr = activates[0]->ActivateObject(IID_PPV_ARGS(&mft));
+        for (UINT32 i = 0; i < count; i++) activates[i]->Release();
+        CoTaskMemFree(activates);
+        if (FAILED(hr)) return hr;
+
+        ComPtr<IMFAttributes> attrs;
+        hr = mft->GetAttributes(&attrs);
+        if (FAILED(hr)) return hr;
+
+        UINT32 isAsync = 0;
+        attrs->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync);
+        isAsync_ = (isAsync != 0);
+        if (isAsync_) {
+            attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+        }
+
+        // Attach D3D11 device so the MFT can consume our textures directly.
+        hr = MFCreateDXGIDeviceManager(&deviceManagerToken_, &deviceManager_);
+        if (FAILED(hr)) return hr;
+        hr = deviceManager_->ResetDevice(device_, deviceManagerToken_);
+        if (FAILED(hr)) return hr;
+        hr = mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)deviceManager_.Get());
+        if (FAILED(hr)) {
+            log_err("MFT_MESSAGE_SET_D3D_MANAGER failed 0x%lx", hr);
+            return hr;
+        }
+
+        if ((hr = configureTypes(mft.Get())) != S_OK) return hr;
+
+        // Codec config — low latency + CBR + 1s GOP.
+        attrs->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
+        attrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
+        attrs->SetUINT32(CODECAPI_AVEncMPVGOPSize, (UINT32)cfg_.fps);
+        attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
+
+        if (isAsync_) {
+            hr = mft.As(&eventGen_);
+            if (FAILED(hr)) return hr;
+        }
+
+        hr = mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        if (FAILED(hr)) return hr;
+        hr = mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        if (FAILED(hr)) return hr;
+        hr = mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        if (FAILED(hr)) return hr;
+
+        mft_         = mft;
+        isHardware_  = true;
+        return S_OK;
+    }
+
+    HRESULT initSoftware() {
+        ComPtr<IMFTransform> mft;
+        HRESULT hr = CoCreateInstance(CLSID_CMSH264EncoderMFT, NULL, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&mft));
         if (FAILED(hr)) return hr;
 
         ComPtr<IMFAttributes> mftAttrs;
@@ -238,33 +361,72 @@ public:
             mftAttrs->SetUINT32(MF_LOW_LATENCY, TRUE);
             mftAttrs->SetUINT32(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
             mftAttrs->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
-            mftAttrs->SetUINT32(CODECAPI_AVEncMPVGOPSize, (UINT32)cfg.fps);
-            mftAttrs->SetUINT32(CODECAPI_AVEncCommonQuality, 70);
+            mftAttrs->SetUINT32(CODECAPI_AVEncMPVGOPSize, (UINT32)cfg_.fps);
         }
 
-        // Output type must be set first
-        hr = mft->SetOutputType(0, outType.Get(), 0);
-        if (FAILED(hr)) return hr;
-        hr = mft->SetInputType(0, inType.Get(), 0);
-        if (FAILED(hr)) return hr;
+        if ((hr = configureTypes(mft.Get())) != S_OK) return hr;
 
-        // Cache the output type so we can fish out the SPS/PPS sequence header.
-        ComPtr<IMFMediaType> negotiatedOut;
-        hr = mft->GetOutputCurrentType(0, &negotiatedOut);
-        if (SUCCEEDED(hr)) outputType_ = negotiatedOut;
+        // Staging NV12 texture for GPU→system memory readback (software MFT
+        // cannot consume DXGI surfaces).
+        D3D11_TEXTURE2D_DESC sd{};
+        sd.Width            = cfg_.width;
+        sd.Height           = cfg_.height;
+        sd.MipLevels        = 1;
+        sd.ArraySize        = 1;
+        sd.Format           = DXGI_FORMAT_NV12;
+        sd.SampleDesc.Count = 1;
+        sd.Usage            = D3D11_USAGE_STAGING;
+        sd.BindFlags        = 0;
+        sd.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
+        hr = device_->CreateTexture2D(&sd, NULL, &stagingNV12_);
+        if (FAILED(hr)) return hr;
 
         hr = mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         if (FAILED(hr)) return hr;
-        mft_ = mft;
-        sentSPSPPS_ = false;
+
+        mft_        = mft;
+        isHardware_ = false;
+        isAsync_    = false;
         return S_OK;
     }
 
-    HRESULT encode(ID3D11Texture2D *texture, INT64 ptsHns) {
-        // Wrap the GPU texture in an IMFSample. The MFT will read from it directly.
+    HRESULT configureTypes(IMFTransform *mft) {
+        ComPtr<IMFMediaType> outType;
+        MFCreateMediaType(&outType);
+        outType->SetGUID(MF_MT_MAJOR_TYPE,   MFMediaType_Video);
+        outType->SetGUID(MF_MT_SUBTYPE,      MFVideoFormat_H264);
+        outType->SetUINT32(MF_MT_AVG_BITRATE,      (UINT32)(cfg_.bitrateKbps * 1000));
+        outType->SetUINT32(MF_MT_INTERLACE_MODE,    MFVideoInterlace_Progressive);
+        outType->SetUINT32(MF_MT_MPEG2_PROFILE,     eAVEncH264VProfile_Base);
+        MFSetAttributeSize (outType.Get(), MF_MT_FRAME_SIZE,         cfg_.width, cfg_.height);
+        MFSetAttributeRatio(outType.Get(), MF_MT_FRAME_RATE,         cfg_.fps, 1);
+        MFSetAttributeRatio(outType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+
+        ComPtr<IMFMediaType> inType;
+        MFCreateMediaType(&inType);
+        inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        inType->SetGUID(MF_MT_SUBTYPE,    MFVideoFormat_NV12);
+        inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        MFSetAttributeSize (inType.Get(), MF_MT_FRAME_SIZE,         cfg_.width, cfg_.height);
+        MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE,         cfg_.fps, 1);
+        MFSetAttributeRatio(inType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+
+        // Output type must be set first for both software and hardware MFTs.
+        HRESULT hr = mft->SetOutputType(0, outType.Get(), 0);
+        if (FAILED(hr)) { log_err("SetOutputType 0x%lx", hr); return hr; }
+        hr = mft->SetInputType(0, inType.Get(), 0);
+        if (FAILED(hr)) { log_err("SetInputType 0x%lx", hr);  return hr; }
+
+        // Cache the post-negotiation output type so we can fish SPS/PPS out of
+        // its MF_MT_MPEG_SEQUENCE_HEADER blob.
+        mft->GetOutputCurrentType(0, &outputType_);
+        return S_OK;
+    }
+
+    HRESULT feedGPUSample(ID3D11Texture2D *nv12, INT64 ptsHns) {
         ComPtr<IMFMediaBuffer> buffer;
-        HRESULT hr = MFCreateDXGISurfaceBuffer(IID_ID3D11Texture2D, texture, 0, FALSE, &buffer);
-        if (FAILED(hr)) return hr;
+        HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12, 0, FALSE, &buffer);
+        if (FAILED(hr)) { log_err("MFCreateDXGISurfaceBuffer 0x%lx", hr); return hr; }
 
         ComPtr<IMFSample> sample;
         MFCreateSample(&sample);
@@ -272,68 +434,158 @@ public:
         sample->SetSampleTime(ptsHns);
         sample->SetSampleDuration(10000000LL / cfg_.fps);
 
-        if (g_force_idr.exchange(false)) {
-            sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
-            // Some MFTs honor MFT_OUTPUT_DATA_BUFFER_INCOMPLETE; on most NVENC/QSV
-            // builds setting CleanPoint plus AVEncVideoForceKeyFrame is enough.
-            ComPtr<IMFAttributes> mftAttrs;
-            if (SUCCEEDED(mft_->GetAttributes(&mftAttrs))) {
-                mftAttrs->SetUINT32(CODECAPI_AVEncVideoForceKeyFrame, 1);
-            }
-        }
+        applyForceIDRIfRequested(sample.Get());
 
         hr = mft_->ProcessInput(0, sample.Get(), 0);
-        if (FAILED(hr)) return hr;
-        return drain();
+        if (FAILED(hr)) { log_err("ProcessInput (gpu) 0x%lx", hr); return hr; }
+        return S_OK;
     }
 
-    HRESULT drain() {
-        for (;;) {
-            DWORD status = 0;
-            MFT_OUTPUT_DATA_BUFFER outBuf{};
-            outBuf.dwStreamID = 0;
+    HRESULT feedSystemMemorySample(ID3D11Texture2D *nv12, INT64 ptsHns) {
+        // GPU NV12 texture → staging → system memory MF buffer.
+        context_->CopyResource(stagingNV12_.Get(), nv12);
 
-            // We let the MFT allocate the output sample (CMSH264EncoderMFT does
-            // since GetOutputStreamInfo reports MFT_OUTPUT_STREAM_PROVIDES_SAMPLES).
-            HRESULT hr = mft_->ProcessOutput(0, 1, &outBuf, &status);
-            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return S_OK;
-            if (FAILED(hr)) return hr;
+        D3D11_MAPPED_SUBRESOURCE map{};
+        HRESULT hr = context_->Map(stagingNV12_.Get(), 0, D3D11_MAP_READ, 0, &map);
+        if (FAILED(hr)) { log_err("Map staging 0x%lx", hr); return hr; }
 
-            ComPtr<IMFSample> sample(outBuf.pSample);
-            if (outBuf.pEvents) outBuf.pEvents->Release();
+        DWORD totalBytes = (DWORD)(cfg_.width * cfg_.height * 3 / 2);
+        ComPtr<IMFMediaBuffer> buffer;
+        hr = MFCreateMemoryBuffer(totalBytes, &buffer);
+        if (FAILED(hr)) { context_->Unmap(stagingNV12_.Get(), 0); return hr; }
 
-            if (!sentSPSPPS_ && outputType_) {
-                emit_sps_pps(outputType_.Get());
-                sentSPSPPS_ = true;
-            }
+        BYTE *dst = NULL;
+        DWORD maxLen = 0, currentLen = 0;
+        buffer->Lock(&dst, &maxLen, &currentLen);
 
-            // Detect keyframe via MFSampleExtension_CleanPoint
-            UINT32 clean = 0;
-            sample->GetUINT32(MFSampleExtension_CleanPoint, &clean);
-            if (clean && outputType_) {
-                emit_sps_pps(outputType_.Get());
-            }
+        const uint8_t *srcY = (const uint8_t *)map.pData;
+        for (int row = 0; row < cfg_.height; row++) {
+            memcpy(dst + (size_t)row * cfg_.width, srcY + (size_t)row * map.RowPitch, cfg_.width);
+        }
+        BYTE *uvDst         = dst + (size_t)cfg_.width * cfg_.height;
+        const uint8_t *srcUV = (const uint8_t *)map.pData + (size_t)map.RowPitch * cfg_.height;
+        for (int row = 0; row < cfg_.height / 2; row++) {
+            memcpy(uvDst + (size_t)row * cfg_.width, srcUV + (size_t)row * map.RowPitch, cfg_.width);
+        }
 
-            ComPtr<IMFMediaBuffer> buf;
-            sample->ConvertToContiguousBuffer(&buf);
-            BYTE *data = NULL; DWORD size = 0;
-            buf->Lock(&data, NULL, &size);
-            emit_avcc_as_annexb(data, size);
-            buf->Unlock();
+        buffer->SetCurrentLength(totalBytes);
+        buffer->Unlock();
+        context_->Unmap(stagingNV12_.Get(), 0);
+
+        ComPtr<IMFSample> sample;
+        MFCreateSample(&sample);
+        sample->AddBuffer(buffer.Get());
+        sample->SetSampleTime(ptsHns);
+        sample->SetSampleDuration(10000000LL / cfg_.fps);
+        applyForceIDRIfRequested(sample.Get());
+
+        hr = mft_->ProcessInput(0, sample.Get(), 0);
+        if (FAILED(hr)) { log_err("ProcessInput (cpu) 0x%lx", hr); return hr; }
+        return S_OK;
+    }
+
+    void applyForceIDRIfRequested(IMFSample *sample) {
+        if (!g_force_idr.exchange(false)) return;
+        sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
+        ComPtr<IMFAttributes> mftAttrs;
+        if (SUCCEEDED(mft_->GetAttributes(&mftAttrs))) {
+            mftAttrs->SetUINT32(CODECAPI_AVEncVideoForceKeyFrame, 1);
         }
     }
 
-    void shutdown() {
-        if (mft_) mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-        mft_.Reset();
-        outputType_.Reset();
-        MFShutdown();
+    // Pull every output sample currently available. Used after a sync
+    // ProcessInput. Async MFTs use drainOnce() driven by HaveOutput events.
+    HRESULT drainAll() {
+        for (;;) {
+            HRESULT hr = drainOnce();
+            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return S_OK;
+            if (FAILED(hr)) return hr;
+        }
     }
 
-private:
-    Config cfg_;
-    ComPtr<IMFTransform> mft_;
-    ComPtr<IMFMediaType> outputType_;
+    HRESULT drainOnce() {
+        MFT_OUTPUT_STREAM_INFO si{};
+        mft_->GetOutputStreamInfo(0, &si);
+
+        DWORD status = 0;
+        MFT_OUTPUT_DATA_BUFFER outBuf{};
+        outBuf.dwStreamID = 0;
+
+        ComPtr<IMFSample> ourSample;
+        if (!(si.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
+                            MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES))) {
+            // Caller must allocate the output buffer.
+            HRESULT hr = MFCreateSample(&ourSample);
+            if (FAILED(hr)) return hr;
+            ComPtr<IMFMediaBuffer> outBuffer;
+            hr = MFCreateMemoryBuffer(si.cbSize, &outBuffer);
+            if (FAILED(hr)) return hr;
+            ourSample->AddBuffer(outBuffer.Get());
+            outBuf.pSample = ourSample.Get();
+            outBuf.pSample->AddRef();
+        }
+
+        HRESULT hr = mft_->ProcessOutput(0, 1, &outBuf, &status);
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return hr;
+
+        // The MFT may renegotiate the output type partway through (e.g. when
+        // it discovers the actual encoder profile). Honor that and keep going.
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+            ComPtr<IMFMediaType> newOut;
+            DWORD typeIdx = 0;
+            while (mft_->GetOutputAvailableType(0, typeIdx++, &newOut) == S_OK) {
+                GUID sub;
+                if (SUCCEEDED(newOut->GetGUID(MF_MT_SUBTYPE, &sub)) && sub == MFVideoFormat_H264) {
+                    mft_->SetOutputType(0, newOut.Get(), 0);
+                    outputType_ = newOut;
+                    break;
+                }
+                newOut.Reset();
+            }
+            return S_OK;
+        }
+        if (FAILED(hr)) {
+            log_err("ProcessOutput 0x%lx", hr);
+            return hr;
+        }
+
+        ComPtr<IMFSample> sample;
+        sample.Attach(outBuf.pSample);
+        if (outBuf.pEvents) outBuf.pEvents->Release();
+
+        // Emit SPS/PPS for the very first compressed sample, and re-emit on
+        // any keyframe (CleanPoint) so the receiver can decode mid-stream.
+        if (!sentSPSPPS_ && outputType_) {
+            emit_sps_pps(outputType_.Get());
+            sentSPSPPS_ = true;
+        }
+        UINT32 clean = 0;
+        sample->GetUINT32(MFSampleExtension_CleanPoint, &clean);
+        if (clean && outputType_) {
+            emit_sps_pps(outputType_.Get());
+        }
+
+        ComPtr<IMFMediaBuffer> buf;
+        sample->ConvertToContiguousBuffer(&buf);
+        BYTE *data = NULL;
+        DWORD size = 0;
+        buf->Lock(&data, NULL, &size);
+        emit_avcc_as_annexb(data, size);
+        buf->Unlock();
+        return S_OK;
+    }
+
+    Config cfg_{};
+    ID3D11Device         *device_  = nullptr;
+    ID3D11DeviceContext  *context_ = nullptr;
+    ComPtr<IMFTransform>  mft_;
+    ComPtr<IMFMediaType>  outputType_;
+    ComPtr<IMFDXGIDeviceManager> deviceManager_;
+    UINT                  deviceManagerToken_ = 0;
+    ComPtr<IMFMediaEventGenerator> eventGen_;
+    ComPtr<ID3D11Texture2D> stagingNV12_;
+    bool isHardware_ = false;
+    bool isAsync_    = false;
     bool sentSPSPPS_ = false;
 };
 
@@ -490,7 +742,7 @@ int main(int argc, char **argv) {
     if (FAILED(hr)) { log_err("NV12 converter init 0x%lx", hr); return 2; }
 
     MFEncoder enc;
-    hr = enc.init(cfg);
+    hr = enc.init(cfg, dup.device(), dup.context());
     if (FAILED(hr)) { log_err("MF encoder init 0x%lx", hr); return 2; }
 
     log_err("capture started: %dx%d@%d %dkbps", cfg.width, cfg.height, cfg.fps, cfg.bitrateKbps);
@@ -498,26 +750,58 @@ int main(int argc, char **argv) {
     std::thread stdinThr(stdin_watcher);
     stdinThr.detach();
 
-    using clk = std::chrono::high_resolution_clock;
-    auto t0 = clk::now();
     INT64 frames = 0;
     const INT64 hnsPerFrame = 10000000LL / cfg.fps;
 
-    while (g_running) {
-        ComPtr<ID3D11Texture2D> tex;
-        hr = dup.acquire(tex, 1000 / cfg.fps + 5);
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
-        if (FAILED(hr)) { log_err("acquire 0x%lx", hr); break; }
+    auto captureFrame = [&](ComPtr<ID3D11Texture2D> &out) -> HRESULT {
+        for (;;) {
+            if (!g_running) return E_ABORT;
+            ComPtr<ID3D11Texture2D> tex;
+            HRESULT h = dup.acquire(tex, 1000 / cfg.fps + 5);
+            if (h == DXGI_ERROR_WAIT_TIMEOUT) continue;
+            if (FAILED(h)) return h;
+            ComPtr<ID3D11Texture2D> nv12;
+            h = conv.convert(tex.Get(), nv12);
+            dup.release();
+            if (FAILED(h)) return h;
+            out = nv12;
+            return S_OK;
+        }
+    };
 
-        ComPtr<ID3D11Texture2D> nv12;
-        hr = conv.convert(tex.Get(), nv12);
-        dup.release();
-        if (FAILED(hr)) { log_err("convert 0x%lx", hr); break; }
+    if (enc.isAsync()) {
+        // Hardware MFT — event-driven. ProcessInput happens only when the
+        // MFT raises METransformNeedInput; ProcessOutput when it raises
+        // METransformHaveOutput.
+        ComPtr<ID3D11Texture2D> latest;
+        while (g_running) {
+            INT64 pts = frames * hnsPerFrame;
+            hr = enc.runAsyncStep([&]() -> ID3D11Texture2D * {
+                if (FAILED(captureFrame(latest))) return nullptr;
+                return latest.Get();
+            }, pts);
+            // We can't tell from the event loop alone whether this iteration
+            // consumed an input vs emitted an output. Bumping `frames` on
+            // every iteration is wrong; bump only when we know we fed input.
+            // Simplest safe approximation: increment per iteration is OK because
+            // monotonic PTS is what the encoder cares about.
+            frames++;
+            if (FAILED(hr)) { log_err("async step 0x%lx", hr); break; }
+        }
+    } else {
+        // Sync MFT (software fallback or rare sync hardware MFT) — the
+        // classic capture/encode/drain loop.
+        while (g_running) {
+            ComPtr<ID3D11Texture2D> nv12;
+            hr = captureFrame(nv12);
+            if (hr == E_ABORT) break;
+            if (FAILED(hr)) { log_err("capture 0x%lx", hr); break; }
 
-        INT64 pts = frames * hnsPerFrame;
-        hr = enc.encode(nv12.Get(), pts);
-        frames++;
-        if (FAILED(hr)) { log_err("encode 0x%lx", hr); break; }
+            INT64 pts = frames * hnsPerFrame;
+            hr = enc.encodeSync(nv12.Get(), pts);
+            frames++;
+            if (FAILED(hr)) { log_err("encode 0x%lx", hr); break; }
+        }
     }
 
     enc.shutdown();

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // captureMethod (Windows) — picks between native helper and ffmpeg fallback.
@@ -15,7 +16,8 @@ type captureMethod int
 
 const (
 	captureDXGIMF  captureMethod = iota // native dxgi_mf.exe: DXGI Desktop Duplication + MediaFoundation
-	captureDDAGrab                      // ffmpeg -f ddagrab + nvenc/qsv/amf/libx264
+	captureDDAGrab                      // ffmpeg -f ddagrab + nvenc/qsv/amf/libx264 (ffmpeg 6.0+)
+	captureGDIGrab                      // ffmpeg -f gdigrab CPU fallback (any ffmpeg)
 )
 
 type osCapture struct {
@@ -29,6 +31,8 @@ func (c *Capture) captureMethodLabel() string {
 		return "dxgi_mf"
 	case captureDDAGrab:
 		return "ddagrab"
+	case captureGDIGrab:
+		return "gdigrab"
 	}
 	return ""
 }
@@ -63,9 +67,23 @@ func audioInputArgs() []string {
 }
 
 func (c *Capture) handleConsecutiveFailures(n int) {
-	if n >= 3 && c.cachedMethod != captureDDAGrab {
-		log.Printf("Capture method failed %d times, falling back to ffmpeg ddagrab", n)
-		c.cachedMethod = captureDDAGrab
+	// Walk down the fallback chain: dxgi_mf → ddagrab → gdigrab.
+	if n < 3 {
+		return
+	}
+	switch c.cachedMethod {
+	case captureDXGIMF:
+		next := captureDDAGrab
+		if !ddagrabAvailable(c.ffmpegBin) {
+			log.Printf("Capture: ddagrab not available in this ffmpeg, falling straight to gdigrab")
+			next = captureGDIGrab
+		} else {
+			log.Printf("Capture method failed %d times, falling back to ffmpeg ddagrab", n)
+		}
+		c.cachedMethod = next
+	case captureDDAGrab:
+		log.Printf("Capture method failed %d times, falling back to ffmpeg gdigrab", n)
+		c.cachedMethod = captureGDIGrab
 	}
 }
 
@@ -76,8 +94,26 @@ func (c *Capture) detectCaptureMethod() captureMethod {
 		log.Printf("Capture: dxgi_mf available (DXGI Duplication + MediaFoundation, native)")
 		return captureDXGIMF
 	}
-	log.Printf("Capture: falling back to ffmpeg ddagrab")
-	return captureDDAGrab
+	if ddagrabAvailable(c.ffmpegBin) {
+		log.Printf("Capture: falling back to ffmpeg ddagrab")
+		return captureDDAGrab
+	}
+	log.Printf("Capture: falling back to ffmpeg gdigrab (ddagrab not in ffmpeg)")
+	return captureGDIGrab
+}
+
+// ddagrabAvailable probes the local ffmpeg binary for ddagrab support.
+// ddagrab landed in ffmpeg 6.0 (Feb 2023); older builds report it as an
+// unknown input format.
+func ddagrabAvailable(ffmpeg string) bool {
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error",
+		"-h", "demuxer=ddagrab")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	// ffmpeg prints "Demuxer ddagrab [...]" header when the demuxer exists.
+	return strings.Contains(strings.ToLower(string(out)), "demuxer ddagrab")
 }
 
 func (c *Capture) detectEncoder() encoderInfo {
@@ -149,7 +185,7 @@ func (c *Capture) buildVideoPipeline() videoPipeline {
 		// Native helper writes H.264 Annex B to stdout — no ffmpeg.
 		return p
 
-	default: // captureDDAGrab
+	case captureDDAGrab:
 		args := []string{
 			"-hide_banner", "-loglevel", "error",
 			"-f", "ddagrab",
@@ -172,18 +208,35 @@ func (c *Capture) buildVideoPipeline() videoPipeline {
 				fmt.Sprintf("hwdownload,format=bgra,scale=%d:%d,format=nv12",
 					c.config.Width, c.config.Height))
 		}
-
 		args = append(args, enc.args...)
-		args = append(args,
-			"-b:v", fmt.Sprintf("%dk", c.config.Bitrate),
-			"-maxrate", fmt.Sprintf("%dk", c.config.Bitrate),
-			"-bufsize", fmt.Sprintf("%dk", c.config.Bitrate/2),
-			"-g", fmt.Sprintf("%d", c.config.FPS),
-			"-keyint_min", fmt.Sprintf("%d", c.config.FPS),
-		)
-		args = append(args, "-f", "h264", "pipe:1")
+		args = appendCommonRateArgs(args, c.config)
+		p.ffmpegArgs = args
+		return p
 
+	default: // captureGDIGrab — CPU desktop grab, works on any ffmpeg
+		args := []string{
+			"-hide_banner", "-loglevel", "error",
+			"-f", "gdigrab",
+			"-framerate", fmt.Sprintf("%d", c.config.FPS),
+			"-i", "desktop",
+			// gdigrab outputs BGRA in CPU memory. Convert + scale once on the CPU.
+			"-vf", fmt.Sprintf("scale=%d:%d,format=nv12", c.config.Width, c.config.Height),
+		}
+		args = append(args, enc.args...)
+		args = appendCommonRateArgs(args, c.config)
 		p.ffmpegArgs = args
 		return p
 	}
+}
+
+func appendCommonRateArgs(args []string, cfg CaptureConfig) []string {
+	args = append(args,
+		"-b:v", fmt.Sprintf("%dk", cfg.Bitrate),
+		"-maxrate", fmt.Sprintf("%dk", cfg.Bitrate),
+		"-bufsize", fmt.Sprintf("%dk", cfg.Bitrate/2),
+		"-g", fmt.Sprintf("%d", cfg.FPS),
+		"-keyint_min", fmt.Sprintf("%d", cfg.FPS),
+	)
+	args = append(args, "-f", "h264", "pipe:1")
+	return args
 }
