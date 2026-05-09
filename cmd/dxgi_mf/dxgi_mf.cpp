@@ -302,14 +302,36 @@ public:
         if (!eventGen_) return E_UNEXPECTED;
         captureCb_ = std::move(cb);
         eventSink_ = new MFEventSink(this);
-        // Arm the first event request — subsequent re-arms happen inside Invoke().
-        return eventGen_->BeginGetEvent(eventSink_, NULL);
+        // Arm the callback BEFORE starting the stream. If we did the streaming
+        // notifies first, the very first METransformNeedInput would be raised
+        // with no callback registered and we'd hang.
+        HRESULT hr = eventGen_->BeginGetEvent(eventSink_, NULL);
+        if (FAILED(hr)) {
+            log_err("BeginGetEvent 0x%lx", hr);
+            return hr;
+        }
+        hr = mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        if (FAILED(hr)) {
+            log_err("NOTIFY_BEGIN_STREAMING 0x%lx", hr);
+            return hr;
+        }
+        hr = mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        if (FAILED(hr)) {
+            log_err("NOTIFY_START_OF_STREAM 0x%lx", hr);
+            return hr;
+        }
+        log_err("async event loop armed; awaiting METransformNeedInput");
+        return S_OK;
     }
 
     // Invoked from MFEventSink::Invoke — runs on an MF worker thread.
     void onAsyncEvent(MediaEventType type) {
         switch (type) {
         case METransformNeedInput: {
+            if (!sawNeedInput_) {
+                log_err("first METransformNeedInput received — encoder is alive");
+                sawNeedInput_ = true;
+            }
             if (!captureCb_) return;
             ComPtr<ID3D11Texture2D> nv12;
             HRESULT hr = captureCb_(nv12);
@@ -324,11 +346,13 @@ public:
             break;
         }
         case METransformHaveOutput:
+            if (!sawHaveOutput_) {
+                log_err("first METransformHaveOutput received — encoded bytes flowing");
+                sawHaveOutput_ = true;
+            }
             drainOnce();
             break;
         case METransformDrainComplete:
-            // we don't currently issue COMMAND_DRAIN on the encoder, so this
-            // shouldn't fire — but if it does, drain anything pending.
             drainAll();
             break;
         default:
@@ -412,12 +436,18 @@ private:
             if (FAILED(hr)) return hr;
         }
 
-        hr = mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-        if (FAILED(hr)) return hr;
-        hr = mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-        if (FAILED(hr)) return hr;
-        hr = mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-        if (FAILED(hr)) return hr;
+        // For async MFTs we deliberately delay NOTIFY_BEGIN_STREAMING /
+        // NOTIFY_START_OF_STREAM until startAsyncEvents() has armed the
+        // IMFAsyncCallback. Otherwise the MFT can raise its first
+        // METransformNeedInput before a callback is registered and the event
+        // is dropped — leaving us blocked forever waiting for an event that
+        // already happened.
+        if (!isAsync_) {
+            hr = mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+            if (FAILED(hr)) return hr;
+            hr = mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+            if (FAILED(hr)) return hr;
+        }
 
         mft_         = mft;
         isHardware_  = true;
@@ -667,6 +697,8 @@ private:
     MFEventSink    *eventSink_ = nullptr;
     INT64           hnsPerFrame_ = 0;
     INT64           frames_      = 0;
+    bool            sawNeedInput_  = false;
+    bool            sawHaveOutput_ = false;
 };
 
 // MFEventSink::Invoke — defined after MFEncoder so it can dispatch into it.
@@ -853,20 +885,33 @@ int main(int argc, char **argv) {
     INT64 frames = 0;
     const INT64 hnsPerFrame = 10000000LL / cfg.fps;
 
+    // captureFrame returns the next NV12 frame. On a fully-idle Windows
+    // desktop DXGI Duplication can return WAIT_TIMEOUT for every call — so
+    // we never block more than ~16ms per call and instead re-issue the most
+    // recent frame so the encoder's stream stays live.
+    ComPtr<ID3D11Texture2D> lastNV12;
     auto captureFrame = [&](ComPtr<ID3D11Texture2D> &out) -> HRESULT {
-        for (;;) {
-            if (!g_running) return E_ABORT;
-            ComPtr<ID3D11Texture2D> tex;
-            HRESULT h = dup.acquire(tex, 1000 / cfg.fps + 5);
-            if (h == DXGI_ERROR_WAIT_TIMEOUT) continue;
-            if (FAILED(h)) return h;
-            ComPtr<ID3D11Texture2D> nv12;
-            h = conv.convert(tex.Get(), nv12);
-            dup.release();
-            if (FAILED(h)) return h;
-            out = nv12;
-            return S_OK;
+        if (!g_running) return E_ABORT;
+        ComPtr<ID3D11Texture2D> tex;
+        HRESULT h = dup.acquire(tex, 1000 / cfg.fps + 5);
+        if (h == DXGI_ERROR_WAIT_TIMEOUT) {
+            if (lastNV12) {
+                out = lastNV12;
+                return S_OK;
+            }
+            // No frame yet — give the duplication object a longer first
+            // chance, then re-issue the cached frame thereafter.
+            h = dup.acquire(tex, 1000);
+            if (h == DXGI_ERROR_WAIT_TIMEOUT) return DXGI_ERROR_WAIT_TIMEOUT;
         }
+        if (FAILED(h)) return h;
+        ComPtr<ID3D11Texture2D> nv12;
+        h = conv.convert(tex.Get(), nv12);
+        dup.release();
+        if (FAILED(h)) return h;
+        out      = nv12;
+        lastNV12 = nv12;
+        return S_OK;
     };
 
     if (enc.isAsync()) {
