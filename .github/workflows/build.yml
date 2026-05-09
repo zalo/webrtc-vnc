@@ -11,6 +11,12 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+# Opt every JavaScript action into Node 24. Node 20 was deprecated on the
+# runners on 2025-09-19; the env var is the supported escape hatch until all
+# the actions we depend on ship Node-24-native versions.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   # ---------------------------------------------------------------------------
   # Linux: full Go build + go vet + cross-build sanity for darwin / windows

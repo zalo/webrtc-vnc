@@ -11,8 +11,8 @@ set OUT=dxgi_mf.exe
 cl /nologo /O2 /EHsc /std:c++17 /DUNICODE /D_UNICODE ^
    dxgi_mf.cpp ^
    /link /OUT:%OUT% ^
-   d3d11.lib dxgi.lib mf.lib mfplat.lib mfreadwrite.lib mfuuid.lib ^
-   wmcodecdspuuid.lib ole32.lib
+   d3d11.lib dxgi.lib dxguid.lib mf.lib mfplat.lib mfreadwrite.lib ^
+   mfuuid.lib wmcodecdspuuid.lib ole32.lib
 
 if errorlevel 1 (
     echo build failed
