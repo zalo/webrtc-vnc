@@ -130,11 +130,25 @@ static bool write_nal(const uint8_t *buf, size_t n) {
 }
 
 // ---------------------------------------------------------------------------
-// Walk an AVCC payload (4-byte big-endian length prefixes) and emit each NAL
-// in Annex B framing.
+// H.264 MFT output payload framing varies by encoder:
+//
+//   - Software CMSH264EncoderMFT:  AVCC (4-byte big-endian length prefixes)
+//   - NVIDIA NVENC MFT:            Annex B (00 00 00 01 start codes)
+//   - Intel QSV / AMD AMF MFTs:    typically Annex B but vendor-specific
+//
+// Auto-detect by sniffing the first 4 bytes and route to the right walker.
+// Both walkers ultimately call write_nal so we always emit consistent 4-byte
+// Annex B start codes downstream.
 // ---------------------------------------------------------------------------
 
-static bool emit_avcc_as_annexb(const uint8_t *avcc, size_t total) {
+static bool starts_with_annexb_sc(const uint8_t *p, size_t n) {
+    if (n >= 4 && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) return true;
+    if (n >= 3 && p[0] == 0 && p[1] == 0 && p[2] == 1)              return true;
+    return false;
+}
+
+// Walk an AVCC payload (4-byte big-endian length prefixes) and emit each NAL.
+static bool emit_avcc(const uint8_t *avcc, size_t total) {
     size_t off = 0;
     while (off + 4 <= total) {
         uint32_t n = ((uint32_t)avcc[off]   << 24) |
@@ -149,32 +163,48 @@ static bool emit_avcc_as_annexb(const uint8_t *avcc, size_t total) {
     return true;
 }
 
-// Emit SPS/PPS extracted from MF_MT_MPEG_SEQUENCE_HEADER.
+// Walk an Annex B payload and emit each NAL.
+static bool emit_annexb(const uint8_t *data, size_t total) {
+    size_t i = 0;
+    while (i < total) {
+        size_t scLen = 0;
+        if (i + 4 <= total && data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1) {
+            scLen = 4;
+        } else if (i + 3 <= total && data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
+            scLen = 3;
+        } else {
+            i++;
+            continue;
+        }
+        size_t nalStart = i + scLen;
+        size_t nalEnd   = nalStart;
+        while (nalEnd < total) {
+            if (nalEnd + 4 <= total && data[nalEnd] == 0 && data[nalEnd+1] == 0 && data[nalEnd+2] == 0 && data[nalEnd+3] == 1) break;
+            if (nalEnd + 3 <= total && data[nalEnd] == 0 && data[nalEnd+1] == 0 && data[nalEnd+2] == 1) break;
+            nalEnd++;
+        }
+        if (nalEnd > nalStart) {
+            if (!write_nal(data + nalStart, nalEnd - nalStart)) return false;
+        }
+        i = nalEnd;
+    }
+    return true;
+}
+
+static bool emit_encoded_payload(const uint8_t *data, size_t total) {
+    if (starts_with_annexb_sc(data, total)) return emit_annexb(data, total);
+    return emit_avcc(data, total);
+}
+
+// Emit SPS/PPS extracted from MF_MT_MPEG_SEQUENCE_HEADER. The blob format
+// varies between MFTs (AVCC length-prefixed for the software MFT, Annex B for
+// most hardware MFTs), so we auto-detect via emit_encoded_payload.
 static bool emit_sps_pps(IMFMediaType *outputType) {
     UINT32 size = 0;
     if (FAILED(outputType->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &size)) || size == 0) return true;
     std::vector<uint8_t> blob(size);
     if (FAILED(outputType->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, blob.data(), size, NULL))) return true;
-
-    // The blob is itself in Annex-B-ish framing (start codes 0x00000001 between NALs).
-    // Walk it and emit each NAL via write_nal so we get consistent 4-byte start codes.
-    size_t i = 0;
-    while (i + 4 <= blob.size()) {
-        if (blob[i] == 0 && blob[i+1] == 0 && blob[i+2] == 0 && blob[i+3] == 1) {
-            size_t start = i + 4;
-            size_t end = start;
-            while (end + 4 <= blob.size()) {
-                if (blob[end] == 0 && blob[end+1] == 0 && blob[end+2] == 0 && blob[end+3] == 1) break;
-                end++;
-            }
-            if (end + 4 > blob.size()) end = blob.size();
-            if (!write_nal(blob.data() + start, end - start)) return false;
-            i = end;
-        } else {
-            i++;
-        }
-    }
-    return true;
+    return emit_encoded_payload(blob.data(), blob.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +240,7 @@ static void stdin_watcher() {
 //      texture, Map() it to system memory, and feed it as a memory buffer.
 //
 // Both paths emit H.264 Annex B (SPS/PPS prepended to every IDR) on stdout
-// via the shared write_nal/emit_avcc_as_annexb helpers above.
+// via the shared write_nal/emit_encoded_payload helpers above.
 // ---------------------------------------------------------------------------
 
 class MFEncoder; // fwd decl
@@ -674,8 +704,26 @@ private:
         BYTE *data = NULL;
         DWORD size = 0;
         buf->Lock(&data, NULL, &size);
-        emit_avcc_as_annexb(data, size);
+
+        // Log the first sample's framing so we can verify we picked the right
+        // walker. Once it's working we never need this again, but it's cheap.
+        if (!loggedFraming_ && size >= 8) {
+            const char *fmt = starts_with_annexb_sc(data, size) ? "Annex B" : "AVCC (length-prefixed)";
+            log_err("first compressed sample (%lu bytes) appears to be %s; head=%02x %02x %02x %02x %02x %02x %02x %02x",
+                    (unsigned long)size, fmt,
+                    data[0], data[1], data[2], data[3],
+                    data[4], data[5], data[6], data[7]);
+            loggedFraming_ = true;
+        }
+        emit_encoded_payload(data, size);
         buf->Unlock();
+
+        emittedSamples_++;
+        emittedBytes_ += size;
+        if (emittedSamples_ % 144 == 0) {
+            log_err("emitted %lld samples, %lld bytes total",
+                    (long long)emittedSamples_, (long long)emittedBytes_);
+        }
         return S_OK;
     }
 
@@ -699,6 +747,9 @@ private:
     INT64           frames_      = 0;
     bool            sawNeedInput_  = false;
     bool            sawHaveOutput_ = false;
+    bool            loggedFraming_ = false;
+    INT64           emittedSamples_ = 0;
+    INT64           emittedBytes_   = 0;
 };
 
 // MFEventSink::Invoke — defined after MFEncoder so it can dispatch into it.
