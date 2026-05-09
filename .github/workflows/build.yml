@@ -1,0 +1,189 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel old runs of the same branch / PR when a new commit lands.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux: full Go build + go vet + cross-build sanity for darwin / windows
+  # ---------------------------------------------------------------------------
+  linux:
+    name: linux (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: install runtime deps
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: build webrtc-vnc (linux/amd64)
+        run: go build -trimpath -ldflags='-s -w' -o webrtc-vnc .
+
+      - name: cross-build sanity — windows/amd64
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags='-s -w' -o webrtc-vnc.exe .
+
+      - name: cross-build sanity — darwin/arm64 (no-cgo stub)
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags='-s -w' -o webrtc-vnc-darwin-arm64 .
+
+      - name: cross-build sanity — darwin/amd64 (no-cgo stub)
+        env:
+          GOOS: darwin
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags='-s -w' -o webrtc-vnc-darwin-amd64 .
+
+      - name: smoke test
+        # Server should start and exit cleanly when sent SIGTERM.
+        # Capture will fail (no display in CI), so we just check the HTTP listener
+        # comes up. -tunnel=false avoids the cloudflared dependency.
+        run: |
+          ./webrtc-vnc -tunnel=false -no-audio -display=:0 &
+          PID=$!
+          for i in $(seq 1 20); do
+            if curl -sSf -m 1 http://127.0.0.1:8080/api/encoder >/dev/null; then
+              echo "server is up"; break
+            fi
+            sleep 0.5
+          done
+          curl -sSf http://127.0.0.1:8080/api/encoder
+          kill $PID
+          wait $PID || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtc-vnc-linux-amd64
+          path: |
+            webrtc-vnc
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # macOS: build the Go server (cgo on for input_darwin.go) and the native
+  # ScreenCaptureKit + VideoToolbox helper.
+  # ---------------------------------------------------------------------------
+  macos:
+    name: macos (macos-14, arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: show toolchains
+        run: |
+          go version
+          xcrun --show-sdk-path
+          xcrun -sdk macosx swiftc --version
+
+      - name: go vet (darwin)
+        env:
+          CGO_ENABLED: '1'
+        run: go vet ./...
+
+      - name: build webrtc-vnc (darwin/arm64, cgo on)
+        env:
+          CGO_ENABLED: '1'
+          GOOS: darwin
+          GOARCH: arm64
+          MACOSX_DEPLOYMENT_TARGET: '12.3'
+        run: |
+          go build -trimpath -ldflags='-s -w' -o webrtc-vnc .
+          file webrtc-vnc
+
+      - name: build screenkit_vt helper (universal arm64+amd64)
+        run: |
+          cd cmd/screenkit_vt
+          make
+          file screenkit_vt
+          cp screenkit_vt ../../screenkit_vt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtc-vnc-darwin-arm64
+          path: |
+            webrtc-vnc
+            screenkit_vt
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Windows: build the Go server (no cgo needed) and the native DXGI + MF
+  # helper. cl.exe is available via the ilammy/msvc-dev-cmd action.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: windows (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: setup MSVC env
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: go vet (windows)
+        env:
+          CGO_ENABLED: '0'
+        run: go vet ./...
+
+      - name: build webrtc-vnc.exe (windows/amd64)
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -trimpath -ldflags='-s -w' -o webrtc-vnc.exe .
+
+      - name: build dxgi_mf.exe helper
+        shell: cmd
+        run: |
+          cd cmd\dxgi_mf
+          call build.bat
+          if errorlevel 1 exit /b 1
+          copy /y dxgi_mf.exe ..\..\dxgi_mf.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtc-vnc-windows-amd64
+          path: |
+            webrtc-vnc.exe
+            dxgi_mf.exe
+          if-no-files-found: error
+          retention-days: 14

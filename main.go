@@ -12,8 +12,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // serverLogBuf is a thread-safe ring buffer of recent log lines.
@@ -61,6 +63,7 @@ func main() {
 	bitrate := flag.Int("bitrate", 1000, "Video bitrate in kbps")
 	encoder := flag.String("encoder", "auto", "Video encoder: auto, nvenc, vaapi, software")
 	noAudio := flag.Bool("no-audio", false, "Disable audio capture")
+	tunnel := flag.Bool("tunnel", true, "Expose this server to the internet via a cloudflared quick tunnel")
 	flag.Parse()
 
 	if *display == "" {
@@ -148,6 +151,28 @@ func main() {
 		Handler: mux,
 	}
 
+	// Optional cloudflared quick tunnel — exposes the local server publicly.
+	var cfTunnel *Tunnel
+	if *tunnel {
+		t, err := StartCloudflaredTunnel(ctx, *port)
+		if err != nil {
+			log.Printf("Tunnel disabled: %v", err)
+		} else {
+			cfTunnel = t
+			defer cfTunnel.Close()
+			go func() {
+				url, err := cfTunnel.WaitForURL(90 * time.Second)
+				if err != nil {
+					log.Printf("Tunnel URL not received: %v", err)
+					return
+				}
+				bar := strings.Repeat("=", 78)
+				log.Printf("\n%s\n  PUBLIC TUNNEL URL: %s\n  WARNING: Anyone with this URL can view and control this computer.\n  Keep it private and disconnect when done. Stop tunnel: -tunnel=false\n%s",
+					bar, url, bar)
+			}()
+		}
+	}
+
 	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -155,6 +180,9 @@ func main() {
 	go func() {
 		<-sigCh
 		log.Println("Shutting down...")
+		if cfTunnel != nil {
+			cfTunnel.Close()
+		}
 		cancel()
 		server.Close()
 	}()

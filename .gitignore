@@ -1,12 +1,21 @@
 # Compiled binary
 webrtc-vnc
+webrtc-vnc.exe
+webrtc-vnc-darwin-arm64
+webrtc-vnc-darwin-amd64
 
 # Local ffmpeg copy with cap_sys_admin (created by setup.sh)
 ffmpeg-cap
 
-# NvFBC/NVENC helper binaries (built from cmd/nvfbc/ by setup.sh)
+# Native capture+encode helpers (built per-OS, see cmd/<helper>/)
 nvfbc_capture
 nvfbc_nvenc
+screenkit_vt
+dxgi_mf
+dxgi_mf.exe
+
+# cloudflared binary built from third_party/cloudflared submodule
+cloudflared-bin
 
 # Go build cache
 *.test
