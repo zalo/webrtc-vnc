@@ -11,12 +11,6 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
-# Opt every JavaScript action into Node 24. Node 20 was deprecated on the
-# runners on 2025-09-19; the env var is the supported escape hatch until all
-# the actions we depend on ship Node-24-native versions.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-
 jobs:
   # ---------------------------------------------------------------------------
   # Linux: full Go build + go vet + cross-build sanity for darwin / windows
@@ -25,11 +19,11 @@ jobs:
     name: linux (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -81,7 +75,7 @@ jobs:
           kill $PID
           wait $PID || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: webrtc-vnc-linux-amd64
           path: |
@@ -97,11 +91,11 @@ jobs:
     name: macos (macos-14, arm64)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -134,7 +128,7 @@ jobs:
           file screenkit_vt
           cp screenkit_vt ../../screenkit_vt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: webrtc-vnc-darwin-arm64
           path: |
@@ -151,11 +145,11 @@ jobs:
     name: windows (windows-latest)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -185,7 +179,7 @@ jobs:
           if errorlevel 1 exit /b 1
           copy /y dxgi_mf.exe ..\..\dxgi_mf.exe
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: webrtc-vnc-windows-amd64
           path: |
