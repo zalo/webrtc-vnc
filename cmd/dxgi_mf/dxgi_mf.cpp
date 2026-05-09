@@ -197,10 +197,12 @@ static void stdin_watcher() {
 //
 //   1. Hardware MFT (preferred): MFTEnumEx finds the NVENC / QSV / AMF MFT
 //      that advertises NV12->H264. We attach a D3D11 device manager so the
-//      encoder consumes our DXGI textures directly with zero CPU copy. The
-//      hardware MFTs on Windows are async, so we drive ProcessInput /
-//      ProcessOutput off the MFT's event queue (METransformNeedInput /
-//      METransformHaveOutput).
+//      encoder consumes our DXGI textures directly with zero CPU copy.
+//
+//      Hardware MFTs on Windows are async — events are delivered via
+//      IMFAsyncCallback (BeginGetEvent / EndGetEvent), NOT via synchronous
+//      GetEvent. Driving them with GetEvent appears to work but the MFT's
+//      internal event queue is never populated, so calls block forever.
 //
 //   2. Software MFT (fallback): the in-box CMSH264EncoderMFT. It does not
 //      accept GPU surfaces, so we copy the NV12 texture into a STAGING
@@ -210,12 +212,61 @@ static void stdin_watcher() {
 // via the shared write_nal/emit_avcc_as_annexb helpers above.
 // ---------------------------------------------------------------------------
 
+class MFEncoder; // fwd decl
+
+// CaptureCallback is invoked from the MF worker thread when the encoder needs
+// a fresh frame (METransformNeedInput). Implementations should populate `out`
+// with an NV12 ID3D11Texture2D and return S_OK. They run on the MF worker
+// thread, so D3D11/DXGI calls inside must coordinate with anything else that
+// touches the device. In our case all D3D11 work happens on this same worker
+// thread, so no extra synchronisation is needed.
+using CaptureCallback = std::function<HRESULT(ComPtr<ID3D11Texture2D> &)>;
+
+// MFEventSink listens for METransformNeedInput / METransformHaveOutput on the
+// MFT's IMFMediaEventGenerator and dispatches back into MFEncoder. Async MFTs
+// require this callback flavour — the synchronous GetEvent path doesn't get
+// populated.
+class MFEventSink : public IMFAsyncCallback {
+public:
+    explicit MFEventSink(MFEncoder *owner) : owner_(owner) {}
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return InterlockedIncrement(&ref_);
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG c = (ULONG)InterlockedDecrement(&ref_);
+        if (c == 0) delete this;
+        return c;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **out) override {
+        if (out == NULL) return E_POINTER;
+        if (iid == IID_IUnknown || iid == __uuidof(IMFAsyncCallback)) {
+            *out = static_cast<IMFAsyncCallback *>(this);
+            AddRef();
+            return S_OK;
+        }
+        *out = NULL;
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE GetParameters(DWORD *flags, DWORD *queue) override {
+        if (flags) *flags = 0;
+        if (queue) *queue = 0;
+        return E_NOTIMPL; // default queue
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(IMFAsyncResult *result) override; // defined after MFEncoder
+
+private:
+    LONG ref_ = 1;
+    MFEncoder *owner_; // non-owning; MFEncoder outlives the sink
+};
+
 class MFEncoder {
 public:
     HRESULT init(const Config &cfg, ID3D11Device *device, ID3D11DeviceContext *context) {
         cfg_     = cfg;
         device_  = device;
         context_ = context;
+        hnsPerFrame_ = 10000000LL / cfg.fps;
 
         HRESULT hr = MFStartup(MF_VERSION);
         if (FAILED(hr)) return hr;
@@ -230,9 +281,8 @@ public:
 
     bool isAsync() const { return isAsync_; }
 
-    // Sync-MFT path: caller has an NV12 texture and wants it encoded right now.
-    // Returns S_OK after the MFT has accepted the input and we've drained any
-    // available output. Used by the software fallback and by sync hardware MFTs.
+    // Sync-MFT path. The software fallback (and rare sync hardware MFTs)
+    // process synchronously: caller hands us a frame, we feed + drain.
     HRESULT encodeSync(ID3D11Texture2D *nv12, INT64 ptsHns) {
         HRESULT hr;
         if (isHardware_) {
@@ -244,30 +294,49 @@ public:
         return drainAll();
     }
 
-    // Async-MFT path: blocks for one event from the MFT's event queue and
-    // dispatches it. METransformNeedInput → call captureCb to obtain a fresh
-    // NV12 texture and feed it. METransformHaveOutput → drain one output
-    // sample and emit Annex B. Returns once one event has been handled.
-    template <typename Cb>
-    HRESULT runAsyncStep(Cb captureCb, INT64 ptsHns) {
-        ComPtr<IMFMediaEvent> evt;
-        HRESULT hr = eventGen_->GetEvent(0, &evt);
-        if (FAILED(hr)) return hr;
-
-        MediaEventType type = MEUnknown;
-        evt->GetType(&type);
-
-        if (type == METransformNeedInput) {
-            ID3D11Texture2D *nv12 = captureCb();
-            if (!nv12) return S_OK; // capture not ready, encoder will get another NeedInput later
-            return feedGPUSample(nv12, ptsHns);
-        }
-        if (type == METransformHaveOutput) {
-            return drainOnce();
-        }
-        // Other events (e.g. METransformDrainComplete) — ignore.
-        return S_OK;
+    // Async-MFT path. Hand us a capture callback and we'll drive the encoder's
+    // event loop until shutdown. All MFT and D3D11 calls happen on the MF
+    // worker thread that fires onAsyncEvent.
+    HRESULT startAsyncEvents(CaptureCallback cb) {
+        if (!eventGen_) return E_UNEXPECTED;
+        captureCb_ = std::move(cb);
+        eventSink_ = new MFEventSink(this);
+        // Arm the first event request — subsequent re-arms happen inside Invoke().
+        return eventGen_->BeginGetEvent(eventSink_, NULL);
     }
+
+    // Invoked from MFEventSink::Invoke — runs on an MF worker thread.
+    void onAsyncEvent(MediaEventType type) {
+        switch (type) {
+        case METransformNeedInput: {
+            if (!captureCb_) return;
+            ComPtr<ID3D11Texture2D> nv12;
+            HRESULT hr = captureCb_(nv12);
+            if (FAILED(hr) || !nv12) return; // we'll get another NeedInput soon
+            INT64 pts = frames_ * hnsPerFrame_;
+            hr = feedGPUSample(nv12.Get(), pts);
+            if (FAILED(hr)) {
+                log_err("async feedGPUSample 0x%lx", hr);
+                return;
+            }
+            frames_++;
+            break;
+        }
+        case METransformHaveOutput:
+            drainOnce();
+            break;
+        case METransformDrainComplete:
+            // we don't currently issue COMMAND_DRAIN on the encoder, so this
+            // shouldn't fire — but if it does, drain anything pending.
+            drainAll();
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Friends — MFEventSink::Invoke pokes the event generator + dispatches.
+    friend class MFEventSink;
 
     void shutdown() {
         if (mft_) {
@@ -278,6 +347,10 @@ public:
         mft_.Reset();
         outputType_.Reset();
         deviceManager_.Reset();
+        if (eventSink_) {
+            eventSink_->Release();
+            eventSink_ = nullptr;
+        }
         eventGen_.Reset();
         stagingNV12_.Reset();
         MFShutdown();
@@ -587,7 +660,33 @@ private:
     bool isHardware_ = false;
     bool isAsync_    = false;
     bool sentSPSPPS_ = false;
+
+    // Async path state
+    CaptureCallback captureCb_;
+    MFEventSink    *eventSink_ = nullptr;
+    INT64           hnsPerFrame_ = 0;
+    INT64           frames_      = 0;
 };
+
+// MFEventSink::Invoke — defined after MFEncoder so it can dispatch into it.
+inline HRESULT MFEventSink::Invoke(IMFAsyncResult *result) {
+    if (!owner_ || !owner_->eventGen_) return S_OK;
+    ComPtr<IMFMediaEvent> evt;
+    HRESULT hr = owner_->eventGen_->EndGetEvent(result, &evt);
+    if (FAILED(hr)) {
+        log_err("EndGetEvent 0x%lx", hr);
+        return S_OK;
+    }
+    MediaEventType type = MEUnknown;
+    evt->GetType(&type);
+    owner_->onAsyncEvent(type);
+
+    if (g_running) {
+        // Re-arm. If the MFT is shutting down this returns MF_E_SHUTDOWN; ignore.
+        owner_->eventGen_->BeginGetEvent(this, NULL);
+    }
+    return S_OK;
+}
 
 // ---------------------------------------------------------------------------
 // DXGI Desktop Duplication
@@ -770,23 +869,19 @@ int main(int argc, char **argv) {
     };
 
     if (enc.isAsync()) {
-        // Hardware MFT — event-driven. ProcessInput happens only when the
-        // MFT raises METransformNeedInput; ProcessOutput when it raises
-        // METransformHaveOutput.
-        ComPtr<ID3D11Texture2D> latest;
+        // Hardware MFT — kick off the IMFAsyncCallback event flow and let it
+        // run on MF worker threads. Main thread just waits for shutdown.
+        hr = enc.startAsyncEvents([&](ComPtr<ID3D11Texture2D> &out) -> HRESULT {
+            return captureFrame(out);
+        });
+        if (FAILED(hr)) {
+            log_err("startAsyncEvents 0x%lx", hr);
+            enc.shutdown();
+            CoUninitialize();
+            return 3;
+        }
         while (g_running) {
-            INT64 pts = frames * hnsPerFrame;
-            hr = enc.runAsyncStep([&]() -> ID3D11Texture2D * {
-                if (FAILED(captureFrame(latest))) return nullptr;
-                return latest.Get();
-            }, pts);
-            // We can't tell from the event loop alone whether this iteration
-            // consumed an input vs emitted an output. Bumping `frames` on
-            // every iteration is wrong; bump only when we know we fed input.
-            // Simplest safe approximation: increment per iteration is OK because
-            // monotonic PTS is what the encoder cares about.
-            frames++;
-            if (FAILED(hr)) { log_err("async step 0x%lx", hr); break; }
+            Sleep(100);
         }
     } else {
         // Sync MFT (software fallback or rare sync hardware MFT) — the
